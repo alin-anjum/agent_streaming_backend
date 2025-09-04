@@ -1,0 +1,17 @@
+{
+  "timestamp": "2025-09-04 23:33:59",
+  "input_json": "test1.json",
+  "narration_text": "Netflix processes over fifteen billion hours of content streaming monthly across one hundred ninety countries, serving two hundred thirty million subscribers simultaneously without significant downtim...",
+  "avatar_model": "enrique_torres (Alin-cc-dataset)",
+  "results": {
+    "avatar_frames_generated": 22,
+    "composed_frames": 12,
+    "video_created": true,
+    "video_file": "rapido_output/RAPIDO_FINAL_VIDEO.mp4",
+    "video_size_bytes": 106556,
+    "video_duration_seconds": 1.5,
+    "video_resolution": "1280x720",
+    "avatar_scale": 0.5,
+    "slide_frame_size": "1280x720"
+  }
+}

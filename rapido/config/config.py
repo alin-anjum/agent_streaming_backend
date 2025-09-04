@@ -16,7 +16,7 @@ class Config:
     # Frame Configuration
     FRAME_RATE = int(os.getenv('FRAME_RATE', '30'))  # FPS for output video
     AVATAR_OVERLAY_POSITION = os.getenv('AVATAR_OVERLAY_POSITION', 'bottom-right')  # Position for avatar overlay
-    AVATAR_SCALE = float(os.getenv('AVATAR_SCALE', '0.3'))  # Scale factor for avatar frames
+    AVATAR_SCALE = float(os.getenv('AVATAR_SCALE', '0.5'))  # Scale factor for avatar frames (increased)
     
     # File Paths
     INPUT_DATA_PATH = os.getenv('INPUT_DATA_PATH', '../test1.json')

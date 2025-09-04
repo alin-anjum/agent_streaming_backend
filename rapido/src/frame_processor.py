@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 class FrameOverlayEngine:
     """Engine for compositing avatar frames onto slide frames."""
     
-    def __init__(self, slide_frames_path: str, output_size: Tuple[int, int] = (1920, 1080)):
+    def __init__(self, slide_frames_path: str, output_size: Tuple[int, int] = (1280, 720)):
         self.slide_frames_path = Path(slide_frames_path)
         self.output_size = output_size
         self.slide_frames = {}  # Cache for slide frames
