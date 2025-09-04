@@ -1,0 +1,135 @@
+# Combined Requirements for Rapido + SyncTalk-FastAPI System
+# This file contains all dependencies needed for both projects
+
+# ============================================================================
+# PYTORCH AND CUDA DEPENDENCIES (install separately with appropriate CUDA version)
+# ============================================================================
+# For CUDA 12.x: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# For CUDA 11.x: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+torch-ema
+ninja
+
+# ============================================================================
+# WEB FRAMEWORKS AND API
+# ============================================================================
+fastapi[standard]
+uvicorn[standard]
+pydantic
+aiohttp==3.8.6
+websockets==11.0.3
+httpx==0.24.1
+requests==2.31.0
+
+# ============================================================================
+# COMPUTER VISION AND IMAGE PROCESSING
+# ============================================================================
+opencv-python>=4.8.0
+Pillow>=10.0.0
+face_alignment==1.4.1
+mediapipe>=0.10.0
+imageio-ffmpeg
+trimesh
+
+# ============================================================================
+# AUDIO PROCESSING
+# ============================================================================
+librosa>=0.10.0
+soundfile>=0.12.0
+resampy
+python_speech_features
+pyaudio
+elevenlabs==0.2.26
+
+# ============================================================================
+# SCIENTIFIC COMPUTING
+# ============================================================================
+numpy==1.24.4
+scipy>=1.10.0
+pandas==2.0.3
+scikit-learn
+matplotlib
+einops
+numba
+
+# ============================================================================
+# DEEP LEARNING AND ML
+# ============================================================================
+transformers==4.36.0
+onnxruntime-gpu
+tensorflow-gpu==2.8.1
+
+# ============================================================================
+# 3D GRAPHICS AND MESH PROCESSING
+# ============================================================================
+PyMCubes==0.1.4
+# pytorch3d  # Install separately via: python ./SyncTalk-FastAPI/scripts/install_pytorch3d.py
+
+# ============================================================================
+# VIDEO PROCESSING
+# ============================================================================
+ffmpeg-python==0.2.0
+
+# ============================================================================
+# UTILITIES AND TOOLS
+# ============================================================================
+tqdm
+rich
+packaging
+configargparse
+python-dotenv==1.0.0
+json5==0.9.14
+
+# ============================================================================
+# LOGGING AND DEVELOPMENT
+# ============================================================================
+tensorboardX
+dearpygui
+
+# ============================================================================
+# METRICS AND EVALUATION
+# ============================================================================
+lpips
+
+# ============================================================================
+# FACEBOOK RESEARCH LIBRARIES
+# ============================================================================
+fvcore
+iopath
+
+# ============================================================================
+# GPU ACCELERATION (choose based on your CUDA version)
+# ============================================================================
+# For CUDA 12.x (recommended for your system):
+cupy-cuda12x
+# For CUDA 11.x:
+# cupy-cuda11x
+
+# ============================================================================
+# INSTALLATION NOTES
+# ============================================================================
+# 1. Install PyTorch first with CUDA support:
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# 2. Install this requirements file:
+#    pip install -r requirements.txt
+#
+# 3. Install PyTorch3D:
+#    python ./SyncTalk-FastAPI/scripts/install_pytorch3d.py
+#
+# 4. Install SyncTalk custom CUDA modules:
+#    cd SyncTalk-FastAPI
+#    pip install ./freqencoder
+#    pip install ./shencoder
+#    pip install ./gridencoder
+#    pip install ./raymarching
+#
+# 5. Set up environment variables in rapido/.env:
+#    ELEVEN_API_KEY=your_api_key
+#    SYNCTALK_SERVER_URL=http://localhost:8000
+#
+# 6. Download SyncTalk model files:
+#    - May.zip -> SyncTalk-FastAPI/data/May/
+#    - trial_may.zip -> SyncTalk-FastAPI/model/trial_may/
+
+
+
