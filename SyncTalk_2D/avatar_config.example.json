@@ -1,0 +1,148 @@
+{
+  "llm": [
+    {
+      "provider": "microservice",
+      "model": "gpt-5",
+      "enabled": true
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-4o-2024-11-20",
+      "enabled": true
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-20250514",
+      "enabled": true
+    },
+    {
+      "provider": "microservice",
+      "model": "gpt-4o-2024-11-20",
+      "enabled": true
+    },
+    {
+      "provider": "microservice",
+      "model": "gpt-4o-2024-11-20",
+      "enabled": true
+    }
+  ],
+  "avatars": {
+    "enrique_torres": {
+      "folder_name": "alin",
+      "checkpoint": "./checkpoint/alin/99.pth",
+      "video_path": "./dataset/alin/alin.mp4",
+      "crop_bbox": [596, 10, 1196, 610],
+      "resize_dims": [350, 350],
+      "is_old_unet": true,
+      "chroma_key": {
+        "enabled": true,
+        "default_background_url": "https://devprofjim.blob.core.windows.net/public-assets/fastavatar/replicate-prediction-zy9qkcebdnrma0cn1vmvrwm7m8.webp",
+        "target_color": "#089831",
+        "color_threshold": 35,
+        "edge_blur": 0.08,
+        "despill_factor": 0.5
+      },
+      "tts": [
+        {
+          "provider": "elevenlabs",
+          "model": "eleven_turbo_v2_5",
+          "voice_id": "u7bRcYbD7visSINTyAT8",
+          "enabled": true
+        },
+        {
+          "provider": "cartesia",
+          "model": "sonic-2",
+          "voice_id": "00967b2f-88a6-4a31-8153-110a92134b9f",
+          "enabled": true
+        }
+      ]
+    },
+    "jason_walley": {
+      "folder_name": "jason",
+      "checkpoint": "./checkpoint/jason/99.pth",
+      "video_path": "./dataset/jason/jason.mp4",
+      "crop_bbox": [668, 26, 1268, 626],
+      "is_old_unet": true,
+      "chroma_key": {
+        "enabled": true,
+        "default_background_url": "https://devprofjim.blob.core.windows.net/public-assets/fastavatar/replicate-prediction-zy9qkcebdnrma0cn1vmvrwm7m8.webp",
+        "target_color": "#beffba",
+        "color_threshold": 35,
+        "edge_blur": 0.08,
+        "despill_factor": 0.5
+      },
+      "tts": [
+        {
+          "provider": "elevenlabs",
+          "model": "eleven_turbo_v2_5",
+          "voice_id": "u7bRcYbD7visSINTyAT8",
+          "enabled": true
+        },
+        {
+          "provider": "cartesia",
+          "model": "sonic-2",
+          "voice_id": "00967b2f-88a6-4a31-8153-110a92134b9f",
+          "enabled": true
+        }
+      ]
+    },
+    "jennifer": {
+      "folder_name": "jennifer",
+      "checkpoint": "./checkpoint/jennifer/99.pth",
+      "video_path": "./dataset/jennifer/jennifer.mp4",
+      "crop_bbox": [701, 84, 1301, 684],
+      "is_old_unet": true,
+      "chroma_key": {
+        "enabled": true,
+        "default_background_url": "https://devprofjim.blob.core.windows.net/public-assets/fastavatar/replicate-prediction-zy9qkcebdnrma0cn1vmvrwm7m8.webp",
+        "target_color": "#cdffb9",
+        "color_threshold": 35,
+        "edge_blur": 0.08,
+        "despill_factor": 0.5
+      },
+      "tts": [
+        {
+          "provider": "elevenlabs",
+          "model": "eleven_turbo_v2_5",
+          "voice_id": "3MEx0xfDtaQCaJNH70em",
+          "enabled": true
+        },
+        {
+          "provider": "cartesia",
+          "model": "sonic-2",
+          "voice_id": "9f208c36-4e07-4a7c-9c94-86c25afe3d0e",
+          "enabled": true
+        }
+      ]
+    },
+    "julie_brooks": {
+      "folder_name": "julie",
+      "checkpoint": "./checkpoint/julie/97.pth",
+      "video_path": "./dataset/julie/julie.mp4",
+      "crop_bbox": [661, 306, 1261, 906],
+      "resize_dims": [350, 350],
+      "chroma_key": {
+        "enabled": true,
+        "default_background_url": "https://devprofjim.blob.core.windows.net/public-assets/fastavatar/replicate-prediction-zy9qkcebdnrma0cn1vmvrwm7m8.webp",
+        "target_color": "#d0ffba",
+        "color_threshold": 35,
+        "edge_blur": 0.08,
+        "despill_factor": 0.5
+      },
+      "tts": [
+        {
+          "provider": "elevenlabs",
+          "model": "eleven_turbo_v2_5",
+          "voice_id": "h2sm0NbeIZXHBzJOMYcQ",
+          "enabled": true
+        },
+        {
+          "provider": "cartesia",
+          "model": "sonic-2",
+          "voice_id": "900d334f-32db-4de1-967b-7969822bc33e",
+          "enabled": true
+        }
+      ]
+    }
+  }
+}

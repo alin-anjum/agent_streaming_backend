@@ -1,0 +1,18 @@
+model:
+  audio_encoder:
+    in_channels: 1  # Mel spectrogram
+    block_out_channels: [32, 64, 128, 256]
+    downsample_factors: [2, 2, 2, 2]
+    dropout: 0.0
+    attn_blocks: [0, 0, 1, 1]  # Attention in last 2 blocks
+  
+  visual_encoder:
+    in_channels: 48  # 16 frames * 3 channels
+    block_out_channels: [64, 128, 256, 512]
+    downsample_factors: [2, 2, 2, 2]
+    dropout: 0.0
+    attn_blocks: [0, 0, 1, 1]
+
+data:
+  lower_half: true  # Focus on mouth region
+  resolution: 256  # Adjust based on your needs

@@ -1,0 +1,119 @@
+# inference_system/test/benchmark_landmark_manager.py
+import os
+import sys
+import time
+import numpy as np
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
+from inference_system.core.landmark_manager import LandmarkManager
+
+def benchmark_landmark_access(landmark_dir: str, num_accesses: int = 1000):
+    """Benchmark landmark access patterns"""
+    
+    print("="*60)
+    print("LANDMARK MANAGER BENCHMARK")
+    print("="*60)
+    
+    # Test 1: Baseline - File I/O every access
+    print("\n1. BASELINE: File I/O per access")
+    print("-"*40)
+    
+    start = time.time()
+    for i in range(min(num_accesses, 100)):  # Only 100 for baseline (too slow)
+        lms_path = os.path.join(landmark_dir, f"{i}.lms")
+        with open(lms_path, "r") as f:
+            lines = f.read().splitlines()
+            lms_list = []
+            for line in lines:
+                arr = line.split(" ")
+                arr = np.array(arr, dtype=np.float32)
+                lms_list.append(arr)
+            lms = np.array(lms_list, dtype=np.int32)
+    
+    baseline_time = time.time() - start
+    baseline_per_access = baseline_time / 100 * 1000  # ms
+    print(f"Time for 100 accesses: {baseline_time:.3f}s")
+    print(f"Average per access: {baseline_per_access:.3f}ms")
+    
+    # Test 2: LandmarkManager - Sync loading
+    print("\n2. LANDMARK MANAGER: All landmarks in memory")
+    print("-"*40)
+    
+    manager = LandmarkManager(landmark_dir, enable_async=False)
+    
+    init_start = time.time()
+    manager.initialize()
+    init_time = time.time() - init_start
+    print(f"Initialization time: {init_time:.3f}s")
+    print(f"Landmarks loaded: {manager.landmarks_loaded_count}")
+    
+    # Random access pattern
+    np.random.seed(42)
+    access_indices = np.random.randint(0, manager.total_landmarks, num_accesses)
+    
+    access_start = time.time()
+    for idx in access_indices:
+        landmark_data = manager.get_landmark(idx)
+        _ = landmark_data.landmarks  # Access the data
+        _ = landmark_data.bbox
+    
+    access_time = time.time() - access_start
+    per_access = access_time / num_accesses * 1000  # ms
+    
+    print(f"Time for {num_accesses} accesses: {access_time:.3f}s")
+    print(f"Average per access: {per_access:.3f}ms")
+    print(f"Speedup vs baseline: {baseline_per_access/per_access:.1f}x")
+    
+    # Test 3: Memory usage
+    print("\n3. MEMORY ANALYSIS")
+    print("-"*40)
+    
+    stats = manager.get_stats()
+    
+    # Estimate memory usage
+    # Each landmark: ~68 points * 2 coords * 4 bytes = ~544 bytes
+    # Plus overhead for numpy array and dataclass
+    estimated_memory = stats['landmarks_in_memory'] * 1024 / (1024*1024)  # MB
+    
+    print(f"Landmarks in memory: {stats['landmarks_in_memory']}")
+    print(f"Estimated memory usage: {estimated_memory:.1f} MB")
+    
+    # Test 4: Sequential access (typical pattern)
+    print("\n4. SEQUENTIAL ACCESS PATTERN")
+    print("-"*40)
+    
+    seq_start = time.time()
+    for i in range(min(num_accesses, manager.total_landmarks)):
+        landmark_data = manager.get_landmark(i)
+        _ = landmark_data.landmarks
+        _ = landmark_data.bbox
+    
+    seq_time = time.time() - seq_start
+    seq_per_access = seq_time / min(num_accesses, manager.total_landmarks) * 1000
+    
+    print(f"Sequential access time: {seq_time:.3f}s")
+    print(f"Average per access: {seq_per_access:.3f}ms")
+    
+    # Summary
+    print("\n" + "="*60)
+    print("SUMMARY")
+    print("="*60)
+    print(f"Baseline (file I/O): {baseline_per_access:.3f} ms/access")
+    print(f"LandmarkManager: {per_access:.3f} ms/access")
+    print(f"Improvement: {baseline_per_access/per_access:.1f}x faster")
+    print(f"Memory overhead: ~{estimated_memory:.1f} MB")
+    
+    manager.cleanup()
+
+if __name__ == "__main__":
+    # Default to May dataset
+    landmark_dir = "dataset/May/landmarks/"
+    
+    if len(sys.argv) > 1:
+        landmark_dir = sys.argv[1]
+    
+    if not os.path.exists(landmark_dir):
+        print(f"Error: Landmark directory not found: {landmark_dir}")
+        sys.exit(1)
+    
+    benchmark_landmark_access(landmark_dir)

@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package streaming;
+
+message FrameMessage {
+    optional bytes video_bytes = 1;
+    optional bytes audio_bytes = 2;
+    optional bool start_speech = 3;
+    optional bool end_speech = 4;
+}

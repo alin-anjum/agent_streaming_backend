@@ -1,0 +1,15 @@
+numpy==1.26.0
+psutil==7.0.0
+GPUtil-fix==1.4.1.2
+ffmpeg-python==0.2.0
+av==14.4.0
+scikit-image==0.25.2
+sewar==0.4.6
+lpips==0.1.4
+# face_alignment==1.4.1
+# mediapipe==0.10.21
+protobuf==6.31.1
+fastapi[standard]==0.116.1
+requests>=2.31.0
+python-dotenv>=1.0.0
+runpod==1.7.10
