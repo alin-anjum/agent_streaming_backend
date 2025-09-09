@@ -10,8 +10,8 @@ class Config:
     ELEVENLABS_VOICE_ID = os.getenv('ELEVENLABS_VOICE_ID', 'pNInz6obpgDQGcFmaJgB')  # Default to Adam voice
     
     # SyncTalk Server Configuration - LOCAL SERVER
-    SYNCTALK_WEBSOCKET_URL = os.getenv('SYNCTALK_WEBSOCKET_URL', 'ws://localhost:8001/ws')
-    SYNCTALK_SERVER_URL = os.getenv('SYNCTALK_SERVER_URL', 'http://localhost:8001')
+    SYNCTALK_WEBSOCKET_URL = os.getenv('SYNCTALK_WEBSOCKET_URL', 'ws://35.172.212.10:8000/ws')
+    SYNCTALK_SERVER_URL = os.getenv('SYNCTALK_SERVER_URL', 'http://35.172.212.10:8000')
     
     # Frame Configuration
     FRAME_RATE = int(os.getenv('FRAME_RATE', '30'))  # FPS for output video

@@ -18,7 +18,7 @@ class ElevenLabsTTSClient:
         self.client = ElevenLabs(api_key=api_key)
         
         # TTS settings
-        self.model = "eleven_multilingual_v2"
+        self.model = "eleven_turbo_v2_5"
         self.output_format = "mp3_44100_128"
         
     async def stream_tts(self, text: str) -> AsyncGenerator[bytes, None]:
@@ -80,40 +80,15 @@ class ElevenLabsTTSClient:
             logger.info(f"Starting OPTIMIZED real-time audio streaming for text: {len(text)} characters")
             logger.info(f"Text preview: {text[:100]}...")
             
-            # Split long text into chunks to avoid ElevenLabs limits
-            max_chunk_length = 1000  # 1000 characters per chunk
-            text_chunks = []
-            
-            if len(text) > max_chunk_length:
-                # Split at sentence boundaries
-                sentences = text.split('. ')
-                current_chunk = ""
-                
-                for sentence in sentences:
-                    if len(current_chunk + sentence + '. ') <= max_chunk_length:
-                        current_chunk += sentence + '. '
-                    else:
-                        if current_chunk:
-                            text_chunks.append(current_chunk.strip())
-                        current_chunk = sentence + '. '
-                
-                if current_chunk:
-                    text_chunks.append(current_chunk.strip())
-                    
-                logger.info(f"Split text into {len(text_chunks)} chunks for better streaming")
-            else:
-                text_chunks = [text]
-            
+            # Stream entire text as one continuous piece (no chunking to prevent hitching)
             loop = asyncio.get_event_loop()
-            total_chunk_count = 0
+            logger.info(f"Streaming entire text as one continuous piece ({len(text)} chars)")
+            logger.info(f"📝 Text preview (first 100 chars): {text[:100]}")
+            logger.info(f"📝 Text ending (last 100 chars): {text[-100:]}")
             
-            # Process each text chunk
-            for chunk_idx, text_chunk in enumerate(text_chunks):
-                logger.info(f"Processing text chunk {chunk_idx + 1}/{len(text_chunks)} ({len(text_chunk)} chars)")
-                
-                await self._stream_single_text_chunk(text_chunk, chunk_callback, loop)
-                
-            logger.info(f"All text chunks processed successfully")
+            await self._stream_single_text_chunk(text, chunk_callback, loop)
+            
+            logger.info(f"✅ Text streaming completed successfully - full {len(text)} characters processed")
             
         except Exception as e:
             logger.error(f"Failed to stream audio: {e}")
@@ -138,18 +113,28 @@ class ElevenLabsTTSClient:
         chunk_count = 0
         
         # Process chunks as they arrive and repackage into 160ms chunks
-        for raw_chunk in audio_stream:
-            if isinstance(raw_chunk, bytes) and len(raw_chunk) > 0:
-                audio_buffer += raw_chunk
-                
-                # Send 160ms chunks when we have enough data
-                while len(audio_buffer) >= target_chunk_size:
-                    chunk_160ms = audio_buffer[:target_chunk_size]
-                    audio_buffer = audio_buffer[target_chunk_size:]
+        total_bytes_received = 0
+        try:
+            for raw_chunk in audio_stream:
+                if isinstance(raw_chunk, bytes) and len(raw_chunk) > 0:
+                    audio_buffer += raw_chunk
+                    total_bytes_received += len(raw_chunk)
                     
-                    chunk_count += 1
-                    logger.debug(f"160ms chunk {chunk_count}: {len(chunk_160ms)} bytes")
-                    await chunk_callback(chunk_160ms)
+                    # Send 160ms chunks when we have enough data
+                    while len(audio_buffer) >= target_chunk_size:
+                        chunk_160ms = audio_buffer[:target_chunk_size]
+                        audio_buffer = audio_buffer[target_chunk_size:]
+                        
+                        chunk_count += 1
+                        logger.debug(f"160ms chunk {chunk_count}: {len(chunk_160ms)} bytes")
+                        await chunk_callback(chunk_160ms)
+            
+            logger.info(f"📊 ElevenLabs streaming completed - {total_bytes_received} bytes received")
+            
+        except Exception as e:
+            logger.error(f"🚨 ElevenLabs streaming error: {e}")
+            logger.info(f"📊 Partial data received: {total_bytes_received} bytes before error")
+            raise
         
         # Send remaining data as final chunk
         if audio_buffer:
@@ -158,6 +143,7 @@ class ElevenLabsTTSClient:
             await chunk_callback(audio_buffer)
         
         logger.info(f"Text chunk completed - {chunk_count} 160ms chunks")
+        logger.info(f"📊 Processed text length: {len(text)} characters")
 
     async def generate_full_audio(self, text: str) -> bytes:
         """

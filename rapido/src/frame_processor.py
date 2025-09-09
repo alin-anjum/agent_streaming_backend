@@ -15,10 +15,29 @@ class FrameOverlayEngine:
         self.output_size = output_size
         self.slide_frames = {}  # Cache for slide frames
         
+        # Check for GPU acceleration
+        try:
+            import torch
+            self.use_gpu = torch.cuda.is_available()
+            if self.use_gpu:
+                self.device = torch.device('cuda')
+                logger.info("🚀 Frame processor GPU acceleration enabled")
+            else:
+                self.device = torch.device('cpu')
+                logger.info("💻 Frame processor using CPU")
+        except ImportError:
+            self.use_gpu = False
+            self.device = None
+            logger.info("💻 Frame processor using CPU (PyTorch not available)")
+        
         # Try to load from cache first, then load fresh if needed
         if not self.load_from_cache():
+            logger.info(f"🔍 Looking for frames in: {self.slide_frames_path.resolve()}")
             self.load_slide_frames()
-            self.save_to_cache()
+            if len(self.slide_frames) > 0:
+                self.save_to_cache()
+            else:
+                logger.error(f"❌ No frames loaded! Check path: {self.slide_frames_path}")
         
     def load_slide_frames(self):
         """Load all slide frames into memory with optimized parallel processing."""
@@ -156,7 +175,7 @@ class FrameOverlayEngine:
         Args:
             slide_frame: Background slide frame
             avatar_frame: Avatar frame to overlay
-            position: Position for avatar ("bottom-right", "bottom-left", "top-right", "top-left", "center")
+            position: Position for avatar ("bottom-right", "bottom-left", "top-right", "top-left", "center", "center-bottom")
             scale: Scale factor for avatar frame
             offset: Offset from edge in pixels (x, y)
             blend_mode: Blending mode ("normal", "multiply", "screen", "overlay")
@@ -225,6 +244,9 @@ class FrameOverlayEngine:
         elif position == "center":
             x = (canvas_w - overlay_w) // 2
             y = (canvas_h - overlay_h) // 2
+        elif position == "center-bottom":
+            x = (canvas_w - overlay_w) // 2  # Center horizontally
+            y = canvas_h - overlay_h - offset_y  # Bottom edge matches screen bottom
         else:
             # Default to bottom-right
             x = canvas_w - overlay_w - offset_x

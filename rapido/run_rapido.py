@@ -22,7 +22,7 @@ if __name__ == "__main__":
         os.environ['INPUT_DATA_PATH'] = str(script_dir.parent / 'test1.json')
     
     if not os.getenv('SLIDE_FRAMES_PATH'):
-        os.environ['SLIDE_FRAMES_PATH'] = str(script_dir.parent / 'frames')
+        os.environ['SLIDE_FRAMES_PATH'] = str(script_dir.parent / 'presentation_frames')
     
     if not os.getenv('OUTPUT_PATH'):
         os.environ['OUTPUT_PATH'] = str(script_dir / 'output')

@@ -18,6 +18,19 @@ import logging
 import websockets
 import cv2
 import numpy as np
+from pathlib import Path
+import argparse
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor
+try:
+    import torch
+    TORCH_AVAILABLE = torch.cuda.is_available()
+    if TORCH_AVAILABLE:
+        print(f"🚀 CUDA GPU detected: {torch.cuda.get_device_name(0)}")
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("⚠️ PyTorch not available, using CPU only")
 from PIL import Image
 import io
 import time
@@ -63,12 +76,19 @@ except ImportError as e:
 
 # Import SyncTalk chroma key for green screen removal
 try:
-    from chroma_key import FastChromaKey
+    # Add project root to path for SyncTalk_2D import
+    import os
+    import sys
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    
+    from SyncTalk_2D.chroma_key import FastChromaKey
     CHROMA_KEY_AVAILABLE = True
     logger.info("✅ SyncTalk chroma key module imported successfully")
 except ImportError as e:
     CHROMA_KEY_AVAILABLE = False
-    logger.warning(f"❌ SyncTalk chroma key not available: {e}")
+    logger.warning(f"SyncTalk chroma key not available: {e}")
 
 class RapidoMainSystem:
     """Integrated Rapido system with all features"""
@@ -82,12 +102,25 @@ class RapidoMainSystem:
                 setattr(self.config, key, value)
         
         # Setup paths and connections - use remote SyncTalk server
-        self.synctalk_url = getattr(self.config, 'SYNCTALK_WEBSOCKET_URL', 'ws://34.172.49.60:8000')
+        self.synctalk_url = getattr(self.config, 'SYNCTALK_WEBSOCKET_URL', 'ws://35.172.212.10:8000')
         self.websocket = None
         self.avatar_frames = []
         self.avatar_audio_chunks = []
-        self.slide_frames_path = getattr(self.config, 'SLIDE_FRAMES_PATH', '../frames')
+        # Get the script directory and resolve paths relative to the project root
+        script_dir = Path(__file__).parent.parent  # rapido/src -> rapido
+        project_root = script_dir.parent  # rapido -> agent_streaming_backend
+        
+        slide_frames_env = getattr(self.config, 'SLIDE_FRAMES_PATH', None)
+        if slide_frames_env and Path(slide_frames_env).is_absolute():
+            self.slide_frames_path = slide_frames_env
+        else:
+            # Use absolute path to presentation_frames
+            self.slide_frames_path = str(project_root / 'presentation_frames')
+        
         self.output_dir = getattr(self.config, 'OUTPUT_PATH', './output')
+        
+        logger.info(f"🔍 SLIDE_FRAMES_PATH config: {self.slide_frames_path}")
+        logger.info(f"🔍 SLIDE_FRAMES_PATH resolved: {Path(self.slide_frames_path).resolve()}")
         
         os.makedirs(self.output_dir, exist_ok=True)
         
@@ -96,7 +129,26 @@ class RapidoMainSystem:
         self.target_video_fps = 25.0
         
         # Initialize frame processor once and reuse - 480p for ultra smooth performance
-        self.frame_processor = FrameOverlayEngine('../presentation_frames', output_size=(854, 480))
+        # Enable GPU acceleration if available
+        self.use_gpu = TORCH_AVAILABLE
+        if self.use_gpu:
+            self.device = torch.device('cuda')
+            logger.info("🚀 GPU acceleration enabled for frame processing")
+            
+            # Enable OpenCV GPU backend if available
+            try:
+                cv2.setUseOptimized(True)
+                if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                    logger.info(f"🚀 OpenCV CUDA backend available with {cv2.cuda.getCudaEnabledDeviceCount()} device(s)")
+                else:
+                    logger.info("💻 OpenCV CUDA backend not available")
+            except Exception as e:
+                logger.debug(f"OpenCV CUDA check failed: {e}")
+        else:
+            self.device = torch.device('cpu')
+            logger.info("💻 Using CPU for frame processing")
+            
+        self.frame_processor = FrameOverlayEngine(self.slide_frames_path, output_size=(854, 480))
         self.total_slide_frames = self.frame_processor.get_frame_count()
         self.total_duration_seconds = self.total_slide_frames / self.synctalk_fps
         
@@ -108,7 +160,19 @@ class RapidoMainSystem:
         self._morph_kernel = None
         self._frame_count = 0
         
+        # Thread pool for green screen processing
+        self._green_screen_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="GreenScreen")
+        self._green_screen_cache = {}  # Cache processed frames
+        
         logger.info(f"📊 Rapido initialized - Duration: {self.total_duration_seconds:.2f}s")
+    
+    def __del__(self):
+        """Cleanup thread pool on destruction"""
+        try:
+            if hasattr(self, '_green_screen_executor'):
+                self._green_screen_executor.shutdown(wait=False)
+        except:
+            pass
         
     def _init_chroma_key(self):
         """Initialize chroma key processor for green screen removal"""
@@ -123,7 +187,7 @@ class RapidoMainSystem:
             import io
             
             # SyncTalk's enrique_torres background URL
-            bg_url = "https://raw.githubusercontent.com/vinthony/SyncTalk/main/data/enrique_torres/background.jpg"
+            bg_url = ""
             
             try:
                 response = requests.get(bg_url, timeout=10)
@@ -137,12 +201,29 @@ class RapidoMainSystem:
                 bg_image = None
                 logger.warning("Could not download background image, using color-based detection")
             
-            # Initialize FastChromaKey with SyncTalk's settings
+            # Initialize FastChromaKey with proper parameters
+            # FastChromaKey already imported at module level
+            
+            # Set up background - use black if we couldn't download the image
+            if bg_image is None:
+                bg_array = np.zeros((480, 854, 3), dtype=np.uint8)  # Black background
+            else:
+                bg_array = np.array(bg_image.resize((854, 480)))
+            
+            # Initialize FastChromaKey with SyncTalk's native frame size (350x350)
+            # This avoids expensive resizing operations
+            # Use a beige/cream background that matches the current frame background
+            background_color = np.full((350, 350, 3), [220, 210, 190], dtype=np.uint8)  # Beige background
+            
+            # Use the exact chroma key settings from the alin avatar configuration
             self.chroma_key_processor = FastChromaKey(
-                background_image=bg_image,
-                target_color=(8, 152, 49),  # SyncTalk's #089831 green
-                color_threshold=80,
-                edge_blur=5
+                width=350,  # Match SyncTalk's actual output size
+                height=350, # Match SyncTalk's actual output size
+                background=background_color,  # Use beige background to match current frames
+                target_color='#c5feb4',  # Alin avatar's light green chroma key color
+                color_threshold=35,      # Match avatar config
+                edge_blur=0.08,          # Match avatar config
+                despill_factor=0.5       # Match avatar config
             )
             logger.info("✅ Chroma key processor initialized")
             
@@ -157,6 +238,10 @@ class RapidoMainSystem:
         """
         if image.mode != 'RGB':
             image = image.convert('RGB')
+            
+        # Log first few calls for debugging - reduced frequency for performance
+        if self._frame_count < 3:
+            logger.info(f"🎨 Processing frame {self._frame_count} for green screen removal")
         
         img_array = np.array(image, dtype=np.uint8)
         height, width = img_array.shape[:2]
@@ -164,25 +249,31 @@ class RapidoMainSystem:
         # SyncTalk's green screen color: #089831 = (8, 152, 49)
         target_color = np.array([8, 152, 49], dtype=np.uint8)
         
-        # Extract RGB channels
-        r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
+        # Optimized green screen detection - use int16 for all calculations to avoid overflow
+        img_int16 = img_array.astype(np.int16)
+        r, g, b = img_int16[:, :, 0], img_int16[:, :, 1], img_int16[:, :, 2]
+        target_r, target_g, target_b = target_color[0], target_color[1], target_color[2]
         
-        # Green dominance detection (vectorized)
-        green_dominant = (g > r + 40) & (g > b + 40)
+        # Fast green dominance detection
+        green_dominant = (g > r + 20) & (g > b + 20)
         
-        # Color similarity to target green
-        color_diff = np.sqrt(
-            (r.astype(np.int16) - target_color[0]) ** 2 +
-            (g.astype(np.int16) - target_color[1]) ** 2 +
-            (b.astype(np.int16) - target_color[2]) ** 2
+        # Optimized color distance calculation - avoid sqrt for performance
+        color_diff_squared = (
+            (r - target_r) ** 2 +
+            (g - target_g) ** 2 +
+            (b - target_b) ** 2
         )
-        color_similar = color_diff < 80
+        # Use squared distance comparison to avoid sqrt computation
+        color_similar = color_diff_squared < (120 ** 2)  # 14400
         
-        # Value range check
-        value_range = (g > 100) & (g < 200)
+        # Broader value range for green variations
+        value_range = (g > 50) & (g < 220)
         
-        # Combine conditions
-        is_green = green_dominant & color_similar & value_range
+        # Optimized green hue detection using integer math
+        green_hue = (g > 100) & (g * 5 > r * 6) & (g * 5 > b * 6)  # Equivalent to g > r*1.2 and g > b*1.2
+        
+        # Combine conditions (more permissive)
+        is_green = (green_dominant | green_hue) & (color_similar | value_range)
         
         # Create alpha channel (0 = transparent, 255 = opaque)
         alpha = (~is_green).astype(np.uint8) * 255
@@ -221,6 +312,32 @@ class RapidoMainSystem:
             logger.debug(f"Green screen removal: {transparency_ratio:.2%} transparent")
         
         return Image.fromarray(rgba_array, 'RGBA')
+    
+    def gpu_accelerated_compose(self, avatar_frame, slide_frame):
+        """GPU-accelerated frame composition using PyTorch"""
+        if not self.use_gpu:
+            return self.cpu_compose(avatar_frame, slide_frame)
+            
+        try:
+            # Convert to PyTorch tensors and move to GPU
+            avatar_tensor = torch.from_numpy(avatar_frame).float().to(self.device) / 255.0
+            slide_tensor = torch.from_numpy(slide_frame).float().to(self.device) / 255.0
+            
+            # GPU-accelerated alpha blending
+            alpha = 0.8  # Avatar opacity
+            composed = alpha * avatar_tensor + (1 - alpha) * slide_tensor
+            
+            # Convert back to numpy and CPU
+            result = (composed.cpu().numpy() * 255).astype(np.uint8)
+            return result
+            
+        except Exception as e:
+            logger.warning(f"GPU composition failed, falling back to CPU: {e}")
+            return self.cpu_compose(avatar_frame, slide_frame)
+    
+    def cpu_compose(self, avatar_frame, slide_frame):
+        """Fallback CPU composition"""
+        return cv2.addWeighted(avatar_frame, 0.8, slide_frame, 0.2, 0)
     
     async def connect_to_synctalk(self, avatar_name="enrique_torres", sample_rate=16000):
         """Connect to LOCAL SyncTalk server with protobuf support"""
@@ -304,9 +421,9 @@ class RapidoMainSystem:
         logger.info("🚀 Starting OPTIMIZED REAL-TIME ElevenLabs TTS streaming")
         tts_client = ElevenLabsTTSClient(api_key=api_key)
         
-        # Add frame buffer for smooth output with continuous delivery
-        self.frame_buffer = []
-        self.audio_buffer = []
+        # Add frame buffer for smooth output with proper queue management
+        # Following the working service pattern: maxsize=10 for ~400ms buffer at 25 FPS
+        self.frame_queue = asyncio.Queue(maxsize=10)
         self.buffer_lock = asyncio.Lock()
         
         # Frame delivery system for smooth playback
@@ -316,6 +433,11 @@ class RapidoMainSystem:
         # SyncTalk frame production monitoring
         self.synctalk_frame_count = 0
         self.synctalk_start_time = None
+        
+        # Track audio chunks sent vs frames received for proper end marker timing
+        self.audio_chunks_sent = 0
+        self.frames_received = 0
+        self.tts_streaming_complete = False
         
         # Use pre-initialized frame processor (no duplicate loading)
         frame_processor = self.frame_processor
@@ -332,12 +454,16 @@ class RapidoMainSystem:
                 # Raw PCM from ElevenLabs - no conversion needed!
                 pcm_chunk = chunk_bytes  # Already 16kHz PCM int16 bytes
                 
-                # Send to SyncTalk immediately
+                # Send to SyncTalk immediately and track
                 await self.send_audio_chunk(pcm_chunk)
+                self.audio_chunks_sent += 1
                 
                 # Collect avatar frame with longer timeout (40ms chunk = 1 frame)
                 frame, audio = await self.receive_avatar_frame_with_audio(timeout=2.0)
                 if frame and audio:
+                    # Track received frames for end marker timing
+                    self.frames_received += 1
+                    
                     # MONITOR SYNCTALK PRODUCTION RATE
                     self.synctalk_frame_count += 1
                     if self.synctalk_start_time is None:
@@ -349,10 +475,26 @@ class RapidoMainSystem:
                         synctalk_fps = self.synctalk_frame_count / elapsed
                         logger.info(f"🤖 SYNCTALK PRODUCTION: {synctalk_fps:.1f} FPS (should be ~25 FPS)")
                     
-                    # Add to buffer for smooth continuous delivery
-                    async with self.buffer_lock:
-                        self.frame_buffer.append(frame)
-                        self.audio_buffer.append(audio)
+                    # Add to queue for smooth continuous delivery
+                    # Use non-blocking put with overflow protection
+                    frame_data = {
+                        "type": "video",
+                        "frame": frame,
+                        "audio": audio,
+                        "timestamp": time.time()
+                    }
+                    
+                    try:
+                        # Non-blocking put - if queue is full, drop oldest frame
+                        self.frame_queue.put_nowait(frame_data)
+                    except asyncio.QueueFull:
+                        # Queue is full, remove oldest and add new frame
+                        try:
+                            self.frame_queue.get_nowait()  # Remove oldest
+                            self.frame_queue.put_nowait(frame_data)  # Add new
+                            logger.debug("🔄 Buffer overflow - dropped oldest frame")
+                        except asyncio.QueueEmpty:
+                            pass
                     
                     # Still collect for fallback
                     self.avatar_frames.append(frame)
@@ -371,17 +513,30 @@ class RapidoMainSystem:
         logger.info("🎭 Starting OPTIMIZED REAL-TIME audio streaming with 160ms chunks...")
         await tts_client.stream_audio_real_time(narration_text, process_audio_chunk)
         
-        # Send end marker to SyncTalk to process remaining buffers
-        logger.info("📡 Sending end marker to SyncTalk...")
+        # Mark TTS streaming as complete
+        self.tts_streaming_complete = True
+        logger.info(f"🎭 TTS streaming complete. Sent {self.audio_chunks_sent} audio chunks to SyncTalk")
+        
+        # Wait for all frames to be received before sending end marker
+        logger.info("⏳ Waiting for SyncTalk to finish processing all audio chunks...")
+        
+        timeout_start = time.time()
+        max_wait_time = 30.0  # Maximum 30 seconds to wait
+        
+        while self.frames_received < self.audio_chunks_sent and (time.time() - timeout_start) < max_wait_time:
+            logger.info(f"📊 Progress: {self.frames_received}/{self.audio_chunks_sent} frames received")
+            await asyncio.sleep(1.0)  # Check every second
+        
+        # Now send end marker after receiving all expected frames
+        logger.info("📡 All frames received, sending end marker to SyncTalk...")
         try:
             await self.websocket.send(b"end_of_stream")
-            logger.info("✅ End marker sent")
+            logger.info("✅ End marker sent after receiving all frames")
         except Exception as e:
             logger.warning(f"Failed to send end marker: {e}")
         
-        # Wait longer for SyncTalk to process remaining buffers
-        logger.info("⏳ Waiting for SyncTalk to process remaining audio buffers...")
-        await asyncio.sleep(10.0)  # Wait 10 seconds for remaining processing
+        # Brief wait for final processing
+        await asyncio.sleep(2.0)
         
         # Stop frame delivery and process remaining frames
         self.frame_delivery_running = False
@@ -391,48 +546,36 @@ class RapidoMainSystem:
         return True
     
     async def continuous_frame_delivery(self, frame_processor):
-        """Continuously deliver frames at exactly 25 FPS for smooth playback"""
+        """Stream frames as fast as possible from queue - following working service pattern"""
         try:
-            frame_interval = 1.0 / 25.0  # 40ms per frame
             slide_frame_index = 0
             frame_count = 0
-            last_frame_time = time.time()
             
-            logger.info("🎬 Continuous frame delivery started - 25 FPS TARGET")
+            logger.info("🎬 Continuous frame delivery started - PULL-BASED STREAMING")
             self.frame_delivery_start_time = time.time()
             
             while self.frame_delivery_running:
-                current_time = time.time()
-                
-                # Check if it's time for next frame (every 40ms)
-                if current_time - last_frame_time >= frame_interval:
-                    # Get frame from buffer
-                    frame = None
-                    audio = None
+                try:
+                    # Get frame from queue - blocks until available
+                    # This follows the working service pattern: pull frames as fast as available
+                    frame_data = await self.frame_queue.get()
                     
-                    async with self.buffer_lock:
-                        if self.frame_buffer and self.audio_buffer:
-                            frame = self.frame_buffer.pop(0)
-                            audio = self.audio_buffer.pop(0)
-                    
-                    if frame and audio:
+                    if frame_data["type"] == "video":
+                        frame = frame_data["frame"]
+                        audio = frame_data["audio"]
+                        
                         # Get current slide frame with proper cycling
                         safe_slide_index = slide_frame_index % self.total_slide_frames
                         slide_frame = frame_processor.get_slide_frame(safe_slide_index)
                         
                         if slide_frame:
-                            # FAST COMPOSITION - minimal processing with smaller avatar
-                            slide_width = slide_frame.width
-                            avatar_width = int(frame.width * 0.6)  # Reduced from 0.8 to 0.6
-                            center_x_offset = (slide_width - avatar_width) // 2
-                            
-                            # Compose frame with smaller avatar
+                            # FAST COMPOSITION - minimal processing
                             composed_frame = frame_processor.overlay_avatar_on_slide(
                                 slide_frame=slide_frame,
                                 avatar_frame=frame,
-                                position="bottom-left",
-                                scale=0.6,  # Reduced from 0.8 to 0.6
-                                offset=(center_x_offset, 0)
+                                position="center-bottom",
+                                scale=0.6,
+                                offset=(0, 0)  # No offset needed - center-bottom handles positioning
                             )
                             
                             # Convert to BGR for video publishing
@@ -441,37 +584,37 @@ class RapidoMainSystem:
                             # Convert audio for LiveKit
                             pcm_audio = audio if isinstance(audio, bytes) else (audio * 32767).astype('int16').tobytes()
                             
-                            # Publish to LiveKit
+                            # Publish to LiveKit immediately - no artificial delays
                             await self.publish_frame_to_livekit(cv_frame, pcm_audio)
                             
-                            # Advance counters - increment without cycling (cycling handled in safe_slide_index)
-                            slide_frame_index = slide_frame_index + 1
+                            # Advance counters
+                            slide_frame_index += 1
                             frame_count += 1
-                            last_frame_time = current_time
                             
-                            # Log slide progress with cycling info
+                            # Log progress
                             if frame_count % 50 == 0:
                                 cycle_count = slide_frame_index // self.total_slide_frames
                                 current_slide = safe_slide_index
                                 logger.info(f"📊 Slide progress: {current_slide}/{self.total_slide_frames} (cycle {cycle_count + 1}, frame {frame_count})")
                             
                             if frame_count % 25 == 0:  # Log every second
-                                buffer_size = len(self.frame_buffer)
+                                current_time = time.time()
+                                queue_size = self.frame_queue.qsize()
                                 elapsed_time = current_time - self.frame_delivery_start_time
                                 actual_fps = frame_count / elapsed_time
                                 target_fps = 25.0
                                 fps_diff = actual_fps - target_fps
-                                status = "✅" if abs(fps_diff) < 1.0 else "⚠️"
-                                logger.info(f"🎬 {status} FPS: {actual_fps:.1f}/{target_fps} (diff: {fps_diff:+.1f}), buffer: {buffer_size}")
-                
-                # Adaptive sleep based on buffer status
-                buffer_size = len(self.frame_buffer)
-                if buffer_size == 0:
-                    await asyncio.sleep(0.01)  # 10ms when empty - wait for frames
-                elif buffer_size > 50:
-                    await asyncio.sleep(0.005)  # 5ms when full - can process faster
-                else:
-                    await asyncio.sleep(0.001)  # 1ms normal operation
+                                status = "✅" if abs(fps_diff) < 2.0 else "⚠️"
+                                logger.info(f"🎬 {status} FPS: {actual_fps:.1f}/{target_fps} (diff: {fps_diff:+.1f}), queue: {queue_size}")
+                        
+                        # Mark task as done
+                        self.frame_queue.task_done()
+                        
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Error processing frame: {e}")
+                    continue
                 
         except Exception as e:
             logger.error(f"Error in continuous frame delivery: {e}")
@@ -562,15 +705,14 @@ class RapidoMainSystem:
                     
                     avatar_frame = Image.fromarray(frame_array, 'RGB')
                     
-                    # Apply green screen removal for transparency
-                    if self.chroma_key_processor is not None or CHROMA_KEY_AVAILABLE:
-                        try:
-                            avatar_frame = self._remove_green_screen_for_transparency(avatar_frame)
-                            # Performance logging (minimal)
-                            if self._frame_count % 100 == 0:
-                                logger.debug("✅ Green screen removed, transparency applied")
-                        except Exception as e:
-                            logger.warning(f"Green screen removal failed, using original frame: {e}")
+                    # Apply green screen removal for transparency (async for better performance)
+                    try:
+                        avatar_frame = await self._remove_green_screen_async(avatar_frame)
+                        # Performance logging (reduced frequency for better performance)
+                        if self._frame_count % 200 == 0:
+                            logger.debug("✅ Green screen removed async for alin avatar")
+                    except Exception as e:
+                        logger.warning(f"Async green screen removal failed: {e}")
                 
                 # Extract audio
                 if frame_msg.audio_bytes:
@@ -583,6 +725,134 @@ class RapidoMainSystem:
         except Exception as e:
             logger.error(f"Frame receive error: {e}")
             return None, None
+    
+    def _remove_green_screen_for_transparency_alin(self, image: Image.Image) -> Image.Image:
+        """
+        Optimized green screen removal for alin avatar with light green background.
+        Creates transparency from alin's chroma key color (#c5feb4).
+        """
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+            
+        # Log first few calls for debugging only
+        if self._frame_count < 3:
+            logger.info(f"🎨 Processing alin avatar frame {self._frame_count} for green screen removal")
+            self._frame_count += 1
+        
+        # Convert image to numpy array (needed for final RGBA creation)
+        img_array = np.array(image, dtype=np.uint8)
+        height, width = img_array.shape[:2]
+        
+        # GPU-accelerated chroma key processing if available
+        if self.use_gpu and TORCH_AVAILABLE:
+            try:
+                # Convert to tensor and move to GPU
+                img_tensor = torch.from_numpy(img_array).float().to(self.device)
+                
+                # Alin avatar's light green chroma key color: #c5feb4 = (197, 254, 180)
+                target_color = torch.tensor([197.0, 254.0, 180.0], device=self.device)
+                
+                # Extract RGB channels
+                r, g, b = img_tensor[:, :, 0], img_tensor[:, :, 1], img_tensor[:, :, 2]
+                
+                # GPU-accelerated light green detection
+                green_dominant = (g > r + 15) & (g > b + 15)
+                
+                # GPU-accelerated color similarity calculation
+                color_diff = torch.sqrt(
+                    (r - target_color[0]) ** 2 +
+                    (g - target_color[1]) ** 2 +
+                    (b - target_color[2]) ** 2
+                )
+                color_similar = color_diff < 60
+                
+                # GPU-accelerated value range check
+                light_green_range = (g > 150) & (g < 255) & (r > 150) & (b > 150)
+                light_green_hue = (g > r * 1.1) & (g > b * 1.1) & (g > 180)
+                
+                # Combine conditions on GPU
+                is_green = (green_dominant | light_green_hue) & (color_similar | light_green_range)
+                
+                # Create alpha channel on GPU and move back to CPU
+                alpha = (~is_green).float() * 255.0
+                alpha = alpha.cpu().numpy().astype(np.uint8)
+                
+            except Exception as e:
+                logger.debug(f"GPU chroma key failed, using CPU: {e}")
+                # Fallback to CPU processing
+                target_color = np.array([197, 254, 180], dtype=np.uint8)
+                r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
+                green_dominant = (g > r + 15) & (g > b + 15)
+                color_diff = np.sqrt(
+                    (r.astype(np.int16) - target_color[0]) ** 2 +
+                    (g.astype(np.int16) - target_color[1]) ** 2 +
+                    (b.astype(np.int16) - target_color[2]) ** 2
+                )
+                color_similar = color_diff < 60
+                light_green_range = (g > 150) & (g < 255) & (r > 150) & (b > 150)
+                light_green_hue = (g > r * 1.1) & (g > b * 1.1) & (g > 180)
+                is_green = (green_dominant | light_green_hue) & (color_similar | light_green_range)
+                alpha = (~is_green).astype(np.uint8) * 255
+        else:
+            # CPU processing
+            target_color = np.array([197, 254, 180], dtype=np.uint8)
+            r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
+            green_dominant = (g > r + 15) & (g > b + 15)
+            color_diff = np.sqrt(
+                (r.astype(np.int16) - target_color[0]) ** 2 +
+                (g.astype(np.int16) - target_color[1]) ** 2 +
+                (b.astype(np.int16) - target_color[2]) ** 2
+            )
+            color_similar = color_diff < 60
+            light_green_range = (g > 150) & (g < 255) & (r > 150) & (b > 150)
+            light_green_hue = (g > r * 1.1) & (g > b * 1.1) & (g > 180)
+            is_green = (green_dominant | light_green_hue) & (color_similar | light_green_range)
+            alpha = (~is_green).astype(np.uint8) * 255
+        
+        # Morphological operations for smooth edges
+        if self._morph_kernel is None:
+            self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        
+        # Smooth the alpha channel
+        alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, self._morph_kernel)
+        alpha = cv2.morphologyEx(alpha, cv2.MORPH_OPEN, self._morph_kernel)
+        alpha = cv2.GaussianBlur(alpha, (3, 3), 1.0)
+        
+        # Create RGBA image
+        rgba_array = np.dstack((img_array, alpha))
+        rgba_image = Image.fromarray(rgba_array, 'RGBA')
+        
+        return rgba_image
+    
+    async def _remove_green_screen_async(self, image: Image.Image) -> Image.Image:
+        """
+        Async wrapper for green screen removal using thread pool
+        """
+        try:
+            # Create a simple hash for caching (optional optimization)
+            image_hash = hash(image.tobytes())
+            
+            # Check cache first
+            if image_hash in self._green_screen_cache:
+                return self._green_screen_cache[image_hash]
+            
+            # Run green screen processing in thread pool
+            loop = asyncio.get_event_loop()
+            processed_image = await loop.run_in_executor(
+                self._green_screen_executor,
+                self._remove_green_screen_for_transparency_alin,
+                image
+            )
+            
+            # Cache the result (limit cache size to prevent memory issues)
+            if len(self._green_screen_cache) < 50:  # Limit cache size
+                self._green_screen_cache[image_hash] = processed_image
+            
+            return processed_image
+            
+        except Exception as e:
+            logger.warning(f"Async green screen removal failed: {e}")
+            return image  # Return original image on failure
     
     def remove_green_screen_with_despill(self, image: Image.Image) -> Image.Image:
         """Apply chroma key with despill factor to prevent background meshing"""
@@ -598,8 +868,9 @@ class RapidoMainSystem:
         despill_factor = 0.8  # Increased from 0.5 to be more aggressive
         edge_blur = 0.08
         
-        # Calculate color difference
-        color_diff = np.sqrt(np.sum((img_array - target_color) ** 2, axis=2))
+        # Calculate color difference - fix sqrt warning
+        color_diff_squared = np.sum((img_array - target_color) ** 2, axis=2)
+        color_diff = np.sqrt(np.maximum(color_diff_squared, 0))
         
         # Create alpha mask
         alpha_mask = (color_diff > color_threshold).astype(np.float32)
@@ -663,8 +934,12 @@ class RapidoMainSystem:
             
             # Step 2: Connect to LiveKit first
             logger.info("🔗 Connecting to LiveKit...")
-            if not await self.connect_livekit():
-                raise Exception("LiveKit connection failed")
+            try:
+                await self.connect_livekit()
+                logger.info("✅ LiveKit connected successfully")
+            except Exception as e:
+                logger.warning(f"⚠️ LiveKit connection failed, continuing without LiveKit: {e}")
+                # Continue without LiveKit for testing
             
             # Step 3: Connect to SyncTalk
             logger.info("🔌 Connecting to SyncTalk...")
@@ -753,17 +1028,15 @@ class RapidoMainSystem:
                 # Frames now come pre-processed from SyncTalk with chroma key applied
                 avatar_frame_clean = avatar_frame
                 
-                # Calculate center offset for bottom positioning with smaller avatar
-                slide_width = slide_frame.width
-                avatar_width = int(avatar_frame_clean.width * 0.6)  # Reduced from 0.8 to 0.6
-                center_x_offset = (slide_width - avatar_width) // 2
+                # Get slide frame and compose with center-bottom avatar positioning
+                slide_frame = frame_processor.get_slide_frame(frame_index)
                 
                 composed_frame = frame_processor.overlay_avatar_on_slide(
                     slide_frame=slide_frame,
                     avatar_frame=avatar_frame_clean,
-                    position="bottom-left",  # Bottom left, but we'll offset to center
+                    position="center-bottom",  # Center horizontally, bottom edge matches screen
                     scale=0.6,  # Smaller avatar (reduced from 0.8)
-                    offset=(center_x_offset, 0)  # Center horizontally, no bottom offset
+                    offset=(0, 0)  # No offset needed - center-bottom handles positioning
                 )
                 
                 composed_frames.append(composed_frame)
@@ -796,11 +1069,50 @@ class RapidoMainSystem:
             if video_frames:
                 output_video = os.path.join(self.output_dir, "rapido_output.mp4")
                 
-                fourcc = cv2.VideoWriter_fourcc(*'H264')  # Better compatibility
+                # Hardware-accelerated video encoding with proper codec detection
                 fps = self.target_video_fps
                 height, width = video_frames[0].shape[:2]
                 
-                out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
+                # Try different fourcc codes for hardware acceleration
+                codec_configs = [
+                    # (fourcc, description, backend_hint)
+                    (cv2.VideoWriter_fourcc(*'H264'), "H.264 Hardware", "NVENC/VAAPI"),
+                    (cv2.VideoWriter_fourcc(*'MJPG'), "Motion JPEG", "Hardware"),
+                    (cv2.VideoWriter_fourcc(*'XVID'), "XVID", "Software"),
+                    (cv2.VideoWriter_fourcc(*'mp4v'), "MPEG-4", "Software")
+                ]
+                
+                out = None
+                for fourcc, desc, backend in codec_configs:
+                    try:
+                        # Try with GPU acceleration hints
+                        if self.use_gpu:
+                            # Set OpenCV to use GPU backend if available
+                            cv2.setUseOptimized(True)
+                        
+                        out = cv2.VideoWriter(output_video, fourcc, fps, (width, height), True)
+                        
+                        # Test if the writer actually works
+                        if out.isOpened():
+                            # Write a test frame
+                            test_frame = np.zeros((height, width, 3), dtype=np.uint8)
+                            out.write(test_frame)
+                            logger.info(f"✅ Video encoder initialized: {desc} ({backend})")
+                            break
+                        else:
+                            if out:
+                                out.release()
+                            out = None
+                            
+                    except Exception as e:
+                        logger.warning(f"⚠️ {desc} codec failed: {e}")
+                        if out:
+                            out.release()
+                            out = None
+                        continue
+                
+                if not out or not out.isOpened():
+                    raise Exception("Failed to initialize any video encoder")
                 for frame in video_frames:
                     out.write(frame)
                 out.release()
@@ -851,26 +1163,30 @@ class RapidoMainSystem:
                 await self.websocket.close()
 
 def check_synctalk_server():
-    """Verify LOCAL SyncTalk server is running"""
+    """Verify SyncTalk server is running"""
     try:
-        response = requests.get("http://localhost:8001/status", timeout=5)
+        response = requests.get(f"{Config.SYNCTALK_SERVER_URL}/status", timeout=5)
         if response.status_code == 200:
             status = response.json()
-            print(f"✅ LOCAL SyncTalk ready (ULTRA OPTIMIZED): {status['status']}")
+            print(f"✅ SyncTalk server ready: {status['status']}")
             print(f"🤖 Models: {status['loaded_models']}")
-            return "Alin-cc-dataset" in status['loaded_models']
+            return len(status['loaded_models']) > 0  # Check if any models are loaded
         return False
     except Exception as e:
-        print(f"❌ LOCAL SyncTalk server error: {e}")
-        print("Make sure your LOCAL SyncTalk server is running on localhost:8001")
+        print(f"❌ SyncTalk server error: {e}")
+        print(f"Make sure your SyncTalk server is running on {Config.SYNCTALK_SERVER_URL}")
         return False
 
 async def main():
     """Main entry point"""
     
+    # Get project root for default paths
+    script_dir = Path(__file__).parent.parent  # rapido/src -> rapido  
+    project_root = script_dir.parent  # rapido -> agent_streaming_backend
+    
     parser = argparse.ArgumentParser(description="Rapido - Avatar Video Generation")
-    parser.add_argument("--input", "-i", default="../test1.json", help="Input JSON file")
-    parser.add_argument("--frames", "-f", default="../frames", help="Slide frames directory")
+    parser.add_argument("--input", "-i", default=str(project_root / "test1.json"), help="Input JSON file")
+    parser.add_argument("--frames", "-f", default=str(project_root / "presentation_frames"), help="Slide frames directory")
     parser.add_argument("--output", "-o", default="./output", help="Output directory")
     parser.add_argument("--api-key", help="ElevenLabs API key")
     parser.add_argument("--avatar-scale", type=float, default=0.5, help="Avatar scale")

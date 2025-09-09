@@ -1,8 +1,8 @@
-aiohttp==3.8.6
+aiohttp>=3.9.0
 websockets==11.0.3
 opencv-python==4.8.1.78
 Pillow==10.0.1
-numpy==1.25.2
+numpy>=1.26.0
 python-dotenv==1.0.0
 elevenlabs==0.2.26
 json5==0.9.14
