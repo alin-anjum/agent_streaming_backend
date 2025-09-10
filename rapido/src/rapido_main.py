@@ -210,20 +210,20 @@ class RapidoMainSystem:
             else:
                 bg_array = np.array(bg_image.resize((854, 480)))
             
-            # Initialize FastChromaKey with SyncTalk's native frame size (350x350)
-            # This avoids expensive resizing operations
+            # Initialize FastChromaKey with SyncTalk's resized frame size (512x512)
+            # This matches the resize_dims from config
             # Use a beige/cream background that matches the current frame background
-            background_color = np.full((350, 350, 3), [220, 210, 190], dtype=np.uint8)  # Beige background
+            background_color = np.full((512, 512, 3), [220, 210, 190], dtype=np.uint8)  # Beige background
             
             # Use the exact chroma key settings from the alin avatar configuration
             self.chroma_key_processor = FastChromaKey(
-                width=350,  # Match SyncTalk's actual output size
-                height=350, # Match SyncTalk's actual output size
+                width=512,  # Match SyncTalk's actual output size after resize
+                height=512, # Match SyncTalk's actual output size after resize
                 background=background_color,  # Use beige background to match current frames
-                target_color='#c5feb4',  # Alin avatar's light green chroma key color
+                target_color='#089831',  # Correct green chroma key color
                 color_threshold=35,      # Match avatar config
-                edge_blur=0.08,          # Match avatar config
-                despill_factor=0.5       # Match avatar config
+                edge_blur=0.4,          # Updated from config
+                despill_factor=0.9       # Updated from config
             )
             logger.info("✅ Chroma key processor initialized")
             
@@ -438,6 +438,9 @@ class RapidoMainSystem:
         self.audio_chunks_sent = 0
         self.frames_received = 0
         self.tts_streaming_complete = False
+        # Each 160ms audio chunk should produce ~4 frames at 25 FPS
+        # 160ms = 0.16s, at 25 FPS = 0.16 * 25 = 4 frames
+        self.expected_frames_per_chunk = 4
         
         # Use pre-initialized frame processor (no duplicate loading)
         frame_processor = self.frame_processor
@@ -458,47 +461,57 @@ class RapidoMainSystem:
                 await self.send_audio_chunk(pcm_chunk)
                 self.audio_chunks_sent += 1
                 
-                # Collect avatar frame with longer timeout (40ms chunk = 1 frame)
-                frame, audio = await self.receive_avatar_frame_with_audio(timeout=2.0)
-                if frame and audio:
-                    # Track received frames for end marker timing
-                    self.frames_received += 1
-                    
-                    # MONITOR SYNCTALK PRODUCTION RATE
-                    self.synctalk_frame_count += 1
-                    if self.synctalk_start_time is None:
-                        self.synctalk_start_time = time.time()
-                    
-                    # Log SyncTalk production rate every 25 frames
-                    if self.synctalk_frame_count % 25 == 0:
-                        elapsed = time.time() - self.synctalk_start_time
-                        synctalk_fps = self.synctalk_frame_count / elapsed
-                        logger.info(f"🤖 SYNCTALK PRODUCTION: {synctalk_fps:.1f} FPS (should be ~25 FPS)")
-                    
-                    # Add to queue for smooth continuous delivery
-                    # Use non-blocking put with overflow protection
-                    frame_data = {
-                        "type": "video",
-                        "frame": frame,
-                        "audio": audio,
-                        "timestamp": time.time()
-                    }
-                    
-                    try:
-                        # Non-blocking put - if queue is full, drop oldest frame
-                        self.frame_queue.put_nowait(frame_data)
-                    except asyncio.QueueFull:
-                        # Queue is full, remove oldest and add new frame
+                # Each 160ms chunk should produce ~4 frames at 25 FPS
+                # Try to collect multiple frames per chunk
+                frames_collected_this_chunk = 0
+                max_frames_to_collect = 4  # We expect up to 4 frames per 160ms chunk
+                
+                for _ in range(max_frames_to_collect):
+                    # Collect avatar frame with timeout
+                    frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.5)
+                    if frame and audio:
+                        # Track received frames for end marker timing
+                        self.frames_received += 1
+                        frames_collected_this_chunk += 1
+                        
+                        # MONITOR SYNCTALK PRODUCTION RATE
+                        self.synctalk_frame_count += 1
+                        if self.synctalk_start_time is None:
+                            self.synctalk_start_time = time.time()
+                        
+                        # Log SyncTalk production rate every 25 frames
+                        if self.synctalk_frame_count % 25 == 0:
+                            elapsed = time.time() - self.synctalk_start_time
+                            synctalk_fps = self.synctalk_frame_count / elapsed
+                            logger.info(f"🤖 SYNCTALK PRODUCTION: {synctalk_fps:.1f} FPS (should be ~25 FPS)")
+                        
+                        # Add to queue for smooth continuous delivery
+                        # Use non-blocking put with overflow protection
+                        frame_data = {
+                            "type": "video",
+                            "frame": frame,
+                            "audio": audio,
+                            "timestamp": time.time()
+                        }
+                        
                         try:
-                            self.frame_queue.get_nowait()  # Remove oldest
-                            self.frame_queue.put_nowait(frame_data)  # Add new
-                            logger.debug("🔄 Buffer overflow - dropped oldest frame")
-                        except asyncio.QueueEmpty:
-                            pass
-                    
-                    # Still collect for fallback
-                    self.avatar_frames.append(frame)
-                    self.avatar_audio_chunks.append(audio)
+                            # Non-blocking put - if queue is full, drop oldest frame
+                            self.frame_queue.put_nowait(frame_data)
+                        except asyncio.QueueFull:
+                            # Queue is full, remove oldest and add new frame
+                            try:
+                                self.frame_queue.get_nowait()  # Remove oldest
+                                self.frame_queue.put_nowait(frame_data)  # Add new
+                                logger.debug("🔄 Buffer overflow - dropped oldest frame")
+                            except asyncio.QueueEmpty:
+                                pass
+                        
+                        # Still collect for fallback
+                        self.avatar_frames.append(frame)
+                        self.avatar_audio_chunks.append(audio)
+                    else:
+                        # No more frames available for this chunk, break early
+                        break
                     
             except Exception as e:
                 logger.error(f"Error processing audio chunk: {e}")
@@ -518,30 +531,114 @@ class RapidoMainSystem:
         logger.info(f"🎭 TTS streaming complete. Sent {self.audio_chunks_sent} audio chunks to SyncTalk")
         
         # Wait for all frames to be received before sending end marker
-        logger.info("⏳ Waiting for SyncTalk to finish processing all audio chunks...")
+        # We expect approximately 4 frames per 160ms audio chunk
+        expected_total_frames = self.audio_chunks_sent * self.expected_frames_per_chunk
+        logger.info(f"⏳ Waiting for SyncTalk to finish processing... Expecting ~{expected_total_frames} frames from {self.audio_chunks_sent} audio chunks")
         
         timeout_start = time.time()
-        max_wait_time = 30.0  # Maximum 30 seconds to wait
+        max_wait_time = 60.0  # Increased to 60 seconds for longer narrations
         
-        while self.frames_received < self.audio_chunks_sent and (time.time() - timeout_start) < max_wait_time:
-            logger.info(f"📊 Progress: {self.frames_received}/{self.audio_chunks_sent} frames received")
+        # Wait for at least 90% of expected frames (allowing for some variance)
+        min_expected_frames = int(expected_total_frames * 0.9)
+        
+        while self.frames_received < min_expected_frames and (time.time() - timeout_start) < max_wait_time:
+            progress_percent = (self.frames_received / expected_total_frames) * 100 if expected_total_frames > 0 else 0
+            logger.info(f"📊 Progress: {self.frames_received}/{expected_total_frames} frames ({progress_percent:.1f}%) - chunks sent: {self.audio_chunks_sent}")
             await asyncio.sleep(1.0)  # Check every second
         
-        # Now send end marker after receiving all expected frames
-        logger.info("📡 All frames received, sending end marker to SyncTalk...")
+        # Log final status before sending end marker
+        if self.frames_received < min_expected_frames:
+            logger.warning(f"⚠️ Timeout reached! Only received {self.frames_received}/{expected_total_frames} frames ({(self.frames_received/expected_total_frames*100):.1f}%)")
+            logger.warning(f"⚠️ Proceeding to send end marker anyway to avoid hanging...")
+        else:
+            logger.info(f"✅ Received {self.frames_received}/{expected_total_frames} frames ({(self.frames_received/expected_total_frames*100):.1f}%)")
+        
+        # Continue collecting frames without sending end marker
+        # Keep the stream alive and let SyncTalk finish processing all audio
+        logger.info("⏳ Continuing to collect frames from SyncTalk...")
+        
+        # Extended collection period - give SyncTalk much more time
+        extended_collection_timeout = 30.0  # 30 seconds to collect remaining frames
+        collection_start_time = time.time()
+        additional_frames_count = 0
+        frames_at_start = self.frames_received
+        
+        # Keep collecting until we stop receiving frames or timeout
+        consecutive_empty_receives = 0
+        max_consecutive_empty = 5  # Stop after 5 consecutive empty receives (2.5 seconds of no frames)
+        
+        while (time.time() - collection_start_time) < extended_collection_timeout:
+            try:
+                # Try to receive frames with shorter timeout
+                frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.5)
+                if frame and audio:
+                    self.frames_received += 1
+                    additional_frames_count += 1
+                    consecutive_empty_receives = 0  # Reset counter
+                    
+                    # Add to queue for delivery
+                    frame_data = {
+                        "type": "video",
+                        "frame": frame,
+                        "audio": audio,
+                        "timestamp": time.time()
+                    }
+                    try:
+                        self.frame_queue.put_nowait(frame_data)
+                    except asyncio.QueueFull:
+                        # Queue full, remove oldest and add new
+                        try:
+                            self.frame_queue.get_nowait()
+                            self.frame_queue.put_nowait(frame_data)
+                        except:
+                            pass
+                    
+                    # Also collect for fallback
+                    self.avatar_frames.append(frame)
+                    self.avatar_audio_chunks.append(audio)
+                    
+                    # Log progress every 25 frames
+                    if additional_frames_count % 25 == 0:
+                        logger.info(f"📦 Collected {additional_frames_count} additional frames (total: {self.frames_received})")
+                else:
+                    consecutive_empty_receives += 1
+                    if consecutive_empty_receives >= max_consecutive_empty:
+                        logger.info(f"🛑 No frames received for {max_consecutive_empty * 0.5} seconds, assuming stream complete")
+                        break
+            except Exception as e:
+                logger.debug(f"Error receiving frame: {e}")
+                consecutive_empty_receives += 1
+                if consecutive_empty_receives >= max_consecutive_empty:
+                    break
+        
+        logger.info(f"📦 Collected {additional_frames_count} additional frames after TTS complete (total: {self.frames_received})")
+        
+        # NOW send end marker after we're really done
+        logger.info("📡 Sending end marker to SyncTalk after collecting all frames...")
         try:
             await self.websocket.send(b"end_of_stream")
-            logger.info("✅ End marker sent after receiving all frames")
+            logger.info("✅ End marker sent")
         except Exception as e:
             logger.warning(f"Failed to send end marker: {e}")
         
-        # Brief wait for final processing
-        await asyncio.sleep(2.0)
-        
-        # Stop frame delivery and process remaining frames
+        # Now stop frame delivery gracefully
+        logger.info("🛑 Stopping frame delivery...")
         self.frame_delivery_running = False
+        
+        # Drain any remaining frames from the queue before stopping
+        while not self.frame_queue.empty():
+            try:
+                await self.frame_queue.get()
+            except:
+                break
+        
         if self.frame_delivery_task:
-            await self.frame_delivery_task
+            # Cancel the task instead of waiting for it to avoid blocking
+            self.frame_delivery_task.cancel()
+            try:
+                await self.frame_delivery_task
+            except asyncio.CancelledError:
+                logger.info("✅ Frame delivery task cancelled successfully")
         
         return True
     
@@ -556,9 +653,15 @@ class RapidoMainSystem:
             
             while self.frame_delivery_running:
                 try:
-                    # Get frame from queue - blocks until available
-                    # This follows the working service pattern: pull frames as fast as available
-                    frame_data = await self.frame_queue.get()
+                    # Get frame from queue with timeout to allow checking frame_delivery_running
+                    # This prevents indefinite blocking when we need to stop
+                    try:
+                        frame_data = await asyncio.wait_for(self.frame_queue.get(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        # Check if we should continue or stop
+                        if not self.frame_delivery_running:
+                            break
+                        continue
                     
                     if frame_data["type"] == "video":
                         frame = frame_data["frame"]
@@ -728,8 +831,8 @@ class RapidoMainSystem:
     
     def _remove_green_screen_for_transparency_alin(self, image: Image.Image) -> Image.Image:
         """
-        Optimized green screen removal for alin avatar with light green background.
-        Creates transparency from alin's chroma key color (#c5feb4).
+        Optimized green screen removal for alin avatar with green background.
+        Creates transparency from chroma key color (#089831).
         """
         if image.mode != 'RGB':
             image = image.convert('RGB')
@@ -749,14 +852,14 @@ class RapidoMainSystem:
                 # Convert to tensor and move to GPU
                 img_tensor = torch.from_numpy(img_array).float().to(self.device)
                 
-                # Alin avatar's light green chroma key color: #c5feb4 = (197, 254, 180)
-                target_color = torch.tensor([197.0, 254.0, 180.0], device=self.device)
+                # Chroma key color: #089831 = (8, 152, 49)
+                target_color = torch.tensor([8.0, 152.0, 49.0], device=self.device)
                 
                 # Extract RGB channels
                 r, g, b = img_tensor[:, :, 0], img_tensor[:, :, 1], img_tensor[:, :, 2]
                 
-                # GPU-accelerated light green detection
-                green_dominant = (g > r + 15) & (g > b + 15)
+                # GPU-accelerated green detection for #089831 (darker green)
+                green_dominant = (g > r + 20) & (g > b + 20)  # Green must be significantly higher
                 
                 # GPU-accelerated color similarity calculation
                 color_diff = torch.sqrt(
@@ -764,14 +867,14 @@ class RapidoMainSystem:
                     (g - target_color[1]) ** 2 +
                     (b - target_color[2]) ** 2
                 )
-                color_similar = color_diff < 60
+                color_similar = color_diff < 40  # Tighter threshold for specific green
                 
-                # GPU-accelerated value range check
-                light_green_range = (g > 150) & (g < 255) & (r > 150) & (b > 150)
-                light_green_hue = (g > r * 1.1) & (g > b * 1.1) & (g > 180)
+                # Detect the specific darker green #089831
+                # R: 8 (very low), G: 152 (medium-high), B: 49 (low)
+                specific_green = (r < 50) & (g > 120) & (g < 180) & (b < 80)
                 
-                # Combine conditions on GPU
-                is_green = (green_dominant | light_green_hue) & (color_similar | light_green_range)
+                # Combine conditions on GPU - simpler for darker green
+                is_green = (green_dominant & color_similar) | specific_green
                 
                 # Create alpha channel on GPU and move back to CPU
                 alpha = (~is_green).float() * 255.0
@@ -780,33 +883,33 @@ class RapidoMainSystem:
             except Exception as e:
                 logger.debug(f"GPU chroma key failed, using CPU: {e}")
                 # Fallback to CPU processing
-                target_color = np.array([197, 254, 180], dtype=np.uint8)
+                target_color = np.array([8, 152, 49], dtype=np.uint8)
                 r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
-                green_dominant = (g > r + 15) & (g > b + 15)
+                green_dominant = (g > r + 20) & (g > b + 20)  # Green must be significantly higher
                 color_diff = np.sqrt(
                     (r.astype(np.int16) - target_color[0]) ** 2 +
                     (g.astype(np.int16) - target_color[1]) ** 2 +
                     (b.astype(np.int16) - target_color[2]) ** 2
                 )
-                color_similar = color_diff < 60
-                light_green_range = (g > 150) & (g < 255) & (r > 150) & (b > 150)
-                light_green_hue = (g > r * 1.1) & (g > b * 1.1) & (g > 180)
-                is_green = (green_dominant | light_green_hue) & (color_similar | light_green_range)
+                color_similar = color_diff < 40  # Tighter threshold
+                # Detect the specific darker green #089831
+                specific_green = (r < 50) & (g > 120) & (g < 180) & (b < 80)
+                is_green = (green_dominant & color_similar) | specific_green
                 alpha = (~is_green).astype(np.uint8) * 255
         else:
             # CPU processing
-            target_color = np.array([197, 254, 180], dtype=np.uint8)
+            target_color = np.array([8, 152, 49], dtype=np.uint8)
             r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
-            green_dominant = (g > r + 15) & (g > b + 15)
+            green_dominant = (g > r + 20) & (g > b + 20)  # Green must be significantly higher
             color_diff = np.sqrt(
                 (r.astype(np.int16) - target_color[0]) ** 2 +
                 (g.astype(np.int16) - target_color[1]) ** 2 +
                 (b.astype(np.int16) - target_color[2]) ** 2
             )
-            color_similar = color_diff < 60
-            light_green_range = (g > 150) & (g < 255) & (r > 150) & (b > 150)
-            light_green_hue = (g > r * 1.1) & (g > b * 1.1) & (g > 180)
-            is_green = (green_dominant | light_green_hue) & (color_similar | light_green_range)
+            color_similar = color_diff < 40  # Tighter threshold
+            # Detect the specific darker green #089831
+            specific_green = (r < 50) & (g > 120) & (g < 180) & (b < 80)
+            is_green = (green_dominant & color_similar) | specific_green
             alpha = (~is_green).astype(np.uint8) * 255
         
         # Morphological operations for smooth edges
@@ -1028,9 +1131,7 @@ class RapidoMainSystem:
                 # Frames now come pre-processed from SyncTalk with chroma key applied
                 avatar_frame_clean = avatar_frame
                 
-                # Get slide frame and compose with center-bottom avatar positioning
-                slide_frame = frame_processor.get_slide_frame(frame_index)
-                
+                # Compose with center-bottom avatar positioning (slide_frame already retrieved above)
                 composed_frame = frame_processor.overlay_avatar_on_slide(
                     slide_frame=slide_frame,
                     avatar_frame=avatar_frame_clean,
