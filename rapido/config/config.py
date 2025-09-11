@@ -35,3 +35,7 @@ class Config:
     # Logging
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
     LOG_FILE = os.getenv('LOG_FILE', 'rapido.log')
+
+    # Dynamic frame capture settings
+    USE_DYNAMIC_CAPTURE = os.getenv('USE_DYNAMIC_CAPTURE', 'True').lower() == 'true'
+    CAPTURE_URL = os.getenv('CAPTURE_URL', 'http://localhost:5173/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4')

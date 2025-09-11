@@ -10,10 +10,11 @@ logger = logging.getLogger(__name__)
 class FrameOverlayEngine:
     """Engine for compositing avatar frames onto slide frames."""
     
-    def __init__(self, slide_frames_path: str, output_size: Tuple[int, int] = (1280, 720)):
+    def __init__(self, slide_frames_path: str, output_size: Tuple[int, int] = (1280, 720), dynamic_mode: bool = False):
         self.slide_frames_path = Path(slide_frames_path)
         self.output_size = output_size
         self.slide_frames = {}  # Cache for slide frames
+        self.dynamic_mode = dynamic_mode  # Flag for dynamic capture mode
         
         # Check for GPU acceleration
         try:
@@ -30,14 +31,20 @@ class FrameOverlayEngine:
             self.device = None
             logger.info("💻 Frame processor using CPU (PyTorch not available)")
         
-        # Try to load from cache first, then load fresh if needed
-        if not self.load_from_cache():
-            logger.info(f"🔍 Looking for frames in: {self.slide_frames_path.resolve()}")
-            self.load_slide_frames()
-            if len(self.slide_frames) > 0:
-                self.save_to_cache()
-            else:
-                logger.error(f"❌ No frames loaded! Check path: {self.slide_frames_path}")
+        # For dynamic capture, always load fresh (no cache) to ensure real-time updates
+        if self.dynamic_mode:
+            logger.info("🎬 Dynamic mode - skipping cache, minimal frame loading")
+            # For dynamic mode, we don't load any frames here - they come from cache system
+        else:
+            # Try to load from cache first, then load fresh if needed
+            if not self.load_from_cache():
+                logger.info(f"🔍 Looking for frames in: {self.slide_frames_path.resolve()}")
+                self.load_slide_frames()
+                if len(self.slide_frames) > 0:
+                    # Save to cache for static frames, but dynamic frames will reload as needed
+                    self.save_to_cache()
+                else:
+                    logger.error(f"❌ No frames loaded! Check path: {self.slide_frames_path}")
         
     def load_slide_frames(self):
         """Load all slide frames into memory with optimized parallel processing."""
@@ -157,7 +164,11 @@ class FrameOverlayEngine:
             logger.warning(f"Failed to save cache: {e}")
     
     def get_slide_frame(self, frame_index: int) -> Optional[Image.Image]:
-        """Get slide frame by index."""
+        """Get slide frame by index - STATIC FRAMES ONLY (dynamic uses cache)."""
+        # For static frames, just return from loaded frames
+        if frame_index >= len(self.slide_frames) and len(self.slide_frames) > 0:
+            frame_index = frame_index % len(self.slide_frames)
+        
         return self.slide_frames.get(frame_index)
     
     def overlay_avatar_on_slide(
