@@ -39,6 +39,9 @@ import argparse
 import requests
 import threading
 
+# Import optimized modules (will check after logger is set up)
+OPTIMIZATIONS_AVAILABLE = False
+
 # Add paths for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
 rapido_root = os.path.dirname(current_dir)
@@ -60,6 +63,18 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Now try to import optimized modules
+try:
+    from livekit_optimized import LiveKitOptimizedPublisher, QualityLevel
+    from frame_pacer import FramePacer, AdaptiveFramePacer
+    from audio_optimizer import AudioOptimizer, BufferMode, AudioStreamSynchronizer
+    from audio_smoother import AudioSmoother
+    OPTIMIZATIONS_AVAILABLE = True
+    logger.info("✅ Optimization modules loaded successfully")
+except ImportError as e:
+    logger.warning(f"⚠️ Optimized modules not available: {e}")
+    OPTIMIZATIONS_AVAILABLE = False
 
 # Import SyncTalk protobuf
 try:
@@ -163,6 +178,30 @@ class RapidoMainSystem:
         # Thread pool for green screen processing
         self._green_screen_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="GreenScreen")
         self._green_screen_cache = {}  # Cache processed frames
+        
+        # Initialize optimization components
+        if OPTIMIZATIONS_AVAILABLE:
+            # Optimized LiveKit publisher
+            self.livekit_publisher = None  # Will be initialized in connect_livekit
+            
+            # Frame pacer for consistent delivery
+            self.frame_pacer = None  # Will be initialized in connect_livekit
+            
+            # Audio optimizer
+            self.audio_optimizer = None  # Will be initialized in connect_livekit
+            
+            # A/V synchronizer
+            self.av_synchronizer = None  # Will be initialized in connect_livekit
+            
+            # Audio smoother for SyncTalk chunks (fixes crackling)
+            # TEMPORARILY DISABLED to test if it's causing issues
+            self.audio_smoother = None  # AudioSmoother(sample_rate=16000, crossfade_ms=2.0)
+            logger.info("⚠️ Audio smoother DISABLED for testing")
+            
+            logger.info("✨ Optimization modules available and ready")
+        else:
+            self.audio_smoother = None
+            logger.warning("⚠️ Running without optimization modules")
         
         logger.info(f"📊 Rapido initialized - Duration: {self.total_duration_seconds:.2f}s")
     
@@ -357,26 +396,201 @@ class RapidoMainSystem:
         if self.websocket:
             await self.websocket.send(audio_data)
     async def connect_livekit(self):
-        """Connect to LiveKit and set up tracks"""
+        """Connect to LiveKit with optimized settings"""
+        # Check if optimizations are available
+        if OPTIMIZATIONS_AVAILABLE:
+            logger.info("Attempting optimized LiveKit connection...")
+            success = await self._connect_livekit_optimized()
+            if not success:
+                logger.warning("Optimized connection failed, falling back to legacy")
+                return await self._connect_livekit_legacy()
+            return success
+        else:
+            logger.info("Optimizations not available, using legacy connection")
+            return await self._connect_livekit_legacy()
+    
+    async def _connect_livekit_optimized(self):
+        """Connect to LiveKit with all optimizations enabled"""
+        try:
+            # First connect using legacy method to ensure compatibility
+            import livekit.api as lk_api
+            import livekit.rtc as rtc
+            import jwt
+            import time
+            
+            # LiveKit credentials
+            LIVEKIT_URL = "wss://agent-s83m6c4y.livekit.cloud"
+            LIVEKIT_API_KEY = "APIEkRN4enNfAzu"
+            LIVEKIT_API_SECRET = "jHEYfEfhaBWQg5isdDgO6e2Xw8zhIvb18KebGwH2ESXC"
+            
+            # Generate JWT token
+            current_time = int(time.time())
+            token_payload = {
+                "iss": LIVEKIT_API_KEY,
+                "sub": "avatar_bot",
+                "aud": "livekit",
+                "exp": current_time + 3600,
+                "nbf": current_time - 10,
+                "iat": current_time,
+                "jti": f"avatar_bot_{current_time}",
+                "video": {
+                    "room": "avatar_room",
+                    "roomJoin": True,
+                    "canPublish": True,
+                    "canSubscribe": True
+                }
+            }
+            token = jwt.encode(token_payload, LIVEKIT_API_SECRET, algorithm="HS256")
+            
+            # Connect to room using standard method
+            self.lk_room = rtc.Room()
+            await self.lk_room.connect(LIVEKIT_URL, token)
+            
+            # Create sources
+            self.video_source = rtc.VideoSource(854, 480)
+            self.audio_source = rtc.AudioSource(16000, 1)
+            
+            # Publish tracks
+            video_track = rtc.LocalVideoTrack.create_video_track("avatar_video", self.video_source)
+            video_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA)
+            self.video_publication = await self.lk_room.local_participant.publish_track(video_track, video_options)
+            
+            audio_track = rtc.LocalAudioTrack.create_audio_track("avatar_audio", self.audio_source)
+            audio_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+            self.audio_publication = await self.lk_room.local_participant.publish_track(audio_track, audio_options)
+            
+            logger.info("✅ Connected to LiveKit (legacy method)")
+            
+            # Now initialize optimization components on top of the basic connection
+            # Initialize frame pacer for consistent delivery with larger buffer
+            self.frame_pacer = AdaptiveFramePacer(
+                target_fps=25.0,
+                min_buffer_size=10,  # Increased from 5
+                max_buffer_size=50   # Increased from 20 for 2 seconds buffer
+            )
+            
+            # Initialize audio optimizer with HIGH_QUALITY mode for stability
+            self.audio_optimizer = AudioOptimizer(
+                sample_rate=16000,
+                channels=1,
+                initial_mode=BufferMode.HIGH_QUALITY  # Start with large buffer
+            )
+            
+            # Initialize A/V synchronizer
+            self.av_synchronizer = AudioStreamSynchronizer(
+                video_fps=25.0,
+                audio_sample_rate=16000
+            )
+            
+            # Create a simple wrapper for frame delivery
+            async def deliver_frame_wrapper(frame):
+                """Deliver frame to LiveKit using legacy video source"""
+                if hasattr(self, 'video_source') and self.video_source:
+                    try:
+                        # Ensure frame is RGB numpy array
+                        if isinstance(frame, Image.Image):
+                            frame = np.array(frame)
+                        
+                        # Create video frame
+                        video_frame = rtc.VideoFrame(
+                            width=frame.shape[1],
+                            height=frame.shape[0],
+                            type=rtc.VideoBufferType.RGB24,
+                            data=frame.tobytes()
+                        )
+                        
+                        # Publish video frame
+                        self.video_source.capture_frame(video_frame)
+                    except Exception as e:
+                        logger.error(f"Error delivering frame: {e}")
+            
+            # Start frame pacer with the wrapper
+            self.frame_pacer_task = asyncio.create_task(self.frame_pacer.start(deliver_frame_wrapper))
+            
+            # Start audio processing loop (modified for direct audio source)
+            async def audio_loop_wrapper():
+                """Process audio through optimizer and send to LiveKit"""
+                audio_sent_count = 0
+                last_log_time = time.time()
+                
+                while True:
+                    try:
+                        if self.audio_optimizer:
+                            # Try to get audio frame - will return None if buffer underrun
+                            audio_frame_bytes = await self.audio_optimizer.get_audio_frame(duration_ms=40)
+                            
+                            if audio_frame_bytes and hasattr(self, 'audio_source'):
+                                # Convert to audio frame
+                                audio_data = np.frombuffer(audio_frame_bytes, dtype=np.int16)
+                                audio_frame = rtc.AudioFrame(
+                                    sample_rate=16000,
+                                    num_channels=1,
+                                    samples_per_channel=len(audio_data),
+                                    data=audio_data.tobytes()
+                                )
+                                await self.audio_source.capture_frame(audio_frame)
+                                audio_sent_count += 1
+                            else:
+                                # No audio available - generate silence to maintain stream
+                                silence_samples = int(16000 * 0.04)  # 40ms of silence
+                                silence_data = np.zeros(silence_samples, dtype=np.int16)
+                                audio_frame = rtc.AudioFrame(
+                                    sample_rate=16000,
+                                    num_channels=1,
+                                    samples_per_channel=silence_samples,
+                                    data=silence_data.tobytes()
+                                )
+                                await self.audio_source.capture_frame(audio_frame)
+                            
+                            # Log audio rate periodically
+                            current_time = time.time()
+                            if current_time - last_log_time > 5.0:
+                                audio_rate = audio_sent_count / (current_time - last_log_time)
+                                logger.debug(f"Audio output rate: {audio_rate:.1f} chunks/sec (target: 25)")
+                                audio_sent_count = 0
+                                last_log_time = current_time
+                        
+                        await asyncio.sleep(0.04)  # 40ms = 25 fps
+                    except Exception as e:
+                        logger.error(f"Error in audio loop: {e}")
+                        await asyncio.sleep(0.04)
+            
+            self.audio_loop_task = asyncio.create_task(audio_loop_wrapper())
+            
+            # Give tasks a moment to start
+            await asyncio.sleep(0.1)
+            
+            logger.info("✅ Connected to LiveKit with optimizations enabled!")
+            logger.info(f"Frame pacer running: {self.frame_pacer.is_running}")
+            logger.info(f"Audio optimizer initialized: {self.audio_optimizer is not None}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to LiveKit (optimized): {e}")
+            return False
+    
+    async def _connect_livekit_legacy(self):
+        """Legacy LiveKit connection without optimizations"""
         try:
             import livekit.api as lk_api
             import livekit.rtc as rtc
             import jwt
             import time
             
-            # LiveKit credentials - UPDATED
+            # LiveKit credentials
             LIVEKIT_URL = "wss://agent-s83m6c4y.livekit.cloud"
             LIVEKIT_API_KEY = "APIEkRN4enNfAzu"
             LIVEKIT_API_SECRET = "jHEYfEfhaBWQg5isdDgO6e2Xw8zhIvb18KebGwH2ESXC"
             
-            # Generate JWT token with proper LiveKit format
+            # Generate JWT token
             current_time = int(time.time())
             token_payload = {
                 "iss": LIVEKIT_API_KEY,
-                "sub": "avatar_bot",  # participant identity
+                "sub": "avatar_bot",
                 "aud": "livekit",
-                "exp": current_time + 3600,  # 1 hour
-                "nbf": current_time - 10,    # 10 seconds ago to account for clock skew
+                "exp": current_time + 3600,
+                "nbf": current_time - 10,
                 "iat": current_time,
                 "jti": f"avatar_bot_{current_time}",
                 "video": {
@@ -392,26 +606,27 @@ class RapidoMainSystem:
             self.lk_room = rtc.Room()
             await self.lk_room.connect(LIVEKIT_URL, token)
             
-            # Create video and audio sources - 480p for ultra smooth performance
+            # Create sources
             self.video_source = rtc.VideoSource(854, 480)
-            self.audio_source = rtc.AudioSource(16000, 1)  # 16kHz mono
+            self.audio_source = rtc.AudioSource(16000, 1)
             
-            # Create and publish video track
+            # Publish tracks
             video_track = rtc.LocalVideoTrack.create_video_track("avatar_video", self.video_source)
             video_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA)
             self.video_publication = await self.lk_room.local_participant.publish_track(video_track, video_options)
             
-            # Create and publish audio track
             audio_track = rtc.LocalAudioTrack.create_audio_track("avatar_audio", self.audio_source)
             audio_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
             self.audio_publication = await self.lk_room.local_participant.publish_track(audio_track, audio_options)
             
-            logger.info("✅ Connected to LiveKit and published tracks!")
+            logger.info("✅ Connected to LiveKit (legacy mode)!")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to connect to LiveKit: {e}")
+            logger.error(f"Failed to connect to LiveKit (legacy): {e}")
             return False
+    
+    # Removed unused methods - frame delivery and audio processing are now handled inline in _connect_livekit_optimized
 
     async def stream_real_time_tts(self, narration_text: str):
         """Stream audio from ElevenLabs in real-time to SyncTalk AND LiveKit with optimized 40ms chunks"""
@@ -422,8 +637,8 @@ class RapidoMainSystem:
         tts_client = ElevenLabsTTSClient(api_key=api_key)
         
         # Add frame buffer for smooth output with proper queue management
-        # Following the working service pattern: maxsize=10 for ~400ms buffer at 25 FPS
-        self.frame_queue = asyncio.Queue(maxsize=10)
+        # INCREASED buffer size to prevent drops
+        self.frame_queue = asyncio.Queue(maxsize=50)  # 2 seconds buffer at 25 FPS
         self.buffer_lock = asyncio.Lock()
         
         # Frame delivery system for smooth playback
@@ -524,6 +739,10 @@ class RapidoMainSystem:
         
         # Start real-time streaming
         logger.info("🎭 Starting OPTIMIZED REAL-TIME audio streaming with 160ms chunks...")
+        if self.audio_optimizer:
+            initial_req = getattr(self.audio_optimizer, 'initial_buffer_requirement', 360)
+            target = getattr(self.audio_optimizer, 'target_buffer_ms', 320)
+            logger.info(f"📦 Audio buffering: {initial_req:.0f}ms initial fill, {target*.5:.0f}ms minimum playback")
         await tts_client.stream_audio_real_time(narration_text, process_audio_chunk)
         
         # Mark TTS streaming as complete
@@ -725,7 +944,84 @@ class RapidoMainSystem:
         logger.info("🎬 Continuous frame delivery stopped")
     
     async def publish_frame_to_livekit(self, bgr_frame, audio_chunk):
-        """Publish frame and audio to LiveKit immediately"""
+        """Publish frame and audio to LiveKit with optimizations if available"""
+        # Check if optimizations are available and initialized
+        use_optimized = (OPTIMIZATIONS_AVAILABLE and 
+                        hasattr(self, 'frame_pacer') and self.frame_pacer and
+                        hasattr(self, 'audio_optimizer') and self.audio_optimizer)
+        
+        if use_optimized:
+            # Convert BGR to RGB for optimized path
+            rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+            return await self.publish_frame_to_livekit_optimized(rgb_frame, audio_chunk)
+        else:
+            # Log once why we're using legacy mode
+            if not hasattr(self, '_logged_legacy_mode'):
+                self._logged_legacy_mode = True
+                reasons = []
+                if not OPTIMIZATIONS_AVAILABLE:
+                    reasons.append("optimizations not available")
+                if not hasattr(self, 'frame_pacer') or not self.frame_pacer:
+                    reasons.append("frame_pacer not initialized")
+                if not hasattr(self, 'audio_optimizer') or not self.audio_optimizer:
+                    reasons.append("audio_optimizer not initialized")
+                logger.info(f"Using legacy LiveKit publishing ({', '.join(reasons)})")
+            
+            # Use legacy publishing
+            return await self._publish_frame_to_livekit_legacy(bgr_frame, audio_chunk)
+    
+    async def publish_frame_to_livekit_optimized(self, composed_frame, audio_chunk):
+        """Optimized frame and audio publishing with buffering"""
+        try:
+            # Add frame to pacer (it should be RGB numpy array)
+            if self.frame_pacer:
+                # Ensure it's a numpy array
+                if isinstance(composed_frame, Image.Image):
+                    frame_array = np.array(composed_frame)
+                else:
+                    frame_array = composed_frame
+                
+                # Add frame with current timestamp
+                success = self.frame_pacer.add_frame(frame_array)
+                if not success:
+                    logger.debug("Frame dropped by pacer")
+            else:
+                logger.warning("Frame pacer not initialized!")
+            
+            # Add audio to optimizer
+            if audio_chunk and len(audio_chunk) > 0 and self.audio_optimizer:
+                # Add audio chunk to buffer
+                success = await self.audio_optimizer.add_audio_chunk(audio_chunk)
+                if not success:
+                    logger.debug("Audio chunk dropped (buffer full)")
+                
+                # Don't adapt too frequently - let buffer stabilize
+                # Only adapt every 10 seconds
+                if not hasattr(self, '_last_audio_adapt_time'):
+                    self._last_audio_adapt_time = 0
+                
+                current_time = time.time()
+                if current_time - self._last_audio_adapt_time > 10.0:
+                    # Use conservative network estimates to keep larger buffers
+                    await self.audio_optimizer.adapt_to_network(
+                        packet_loss=0.5,  # Assume slight packet loss to keep buffer large
+                        rtt_ms=100.0      # Assume moderate RTT
+                    )
+                    self._last_audio_adapt_time = current_time
+            
+            # Log performance metrics periodically
+            if not hasattr(self, '_publish_count'):
+                self._publish_count = 0
+            self._publish_count += 1
+                
+            if self._publish_count % 100 == 0:  # Every 4 seconds at 25fps
+                self._log_optimization_metrics()
+                
+        except Exception as e:
+            logger.error(f"Error in optimized publishing: {e}")
+    
+    async def _publish_frame_to_livekit_legacy(self, bgr_frame, audio_chunk):
+        """Legacy frame and audio publishing"""
         try:
             import livekit.rtc as rtc
             
@@ -743,23 +1039,13 @@ class RapidoMainSystem:
                 data=rgb_frame.tobytes()
             )
             
-            # Publish video frame (capture_frame is NOT async)
+            # Publish video frame
             self.video_source.capture_frame(video_frame)
             
             # Create audio frame from PCM chunk
             if len(audio_chunk) > 0:
-                # Convert bytes to int16 array
                 audio_data = np.frombuffer(audio_chunk, dtype=np.int16)
                 samples_per_channel = len(audio_data)
-                
-                # Debug audio info
-                if hasattr(self, '_audio_debug_count'):
-                    self._audio_debug_count += 1
-                else:
-                    self._audio_debug_count = 1
-                
-                if self._audio_debug_count % 25 == 0:  # Log every second
-                    logger.info(f"🔊 Audio: {samples_per_channel} samples, {len(audio_chunk)} bytes, 16kHz mono")
                 
                 audio_frame = rtc.AudioFrame(
                     sample_rate=16000,
@@ -768,14 +1054,56 @@ class RapidoMainSystem:
                     data=audio_data.tobytes()
                 )
                 
-                # Publish audio frame (capture_frame IS async for audio)
                 await self.audio_source.capture_frame(audio_frame)
                 
-                if self._audio_debug_count % 25 == 0:
-                    logger.info(f"✅ Audio frame published to LiveKit")
-                
         except Exception as e:
-            logger.error(f"Error publishing to LiveKit: {e}")
+            logger.error(f"Error in legacy publishing: {e}")
+    
+    def _log_optimization_metrics(self):
+        """Log comprehensive optimization metrics"""
+        try:
+            if self.frame_pacer:
+                metrics = self.frame_pacer.get_metrics()
+                logger.info(
+                    f"📊 Frame Pacer: {metrics.actual_fps:.1f}/{metrics.target_fps:.0f} FPS | "
+                    f"Delivered: {metrics.frames_delivered} | "
+                    f"Dropped: {metrics.frames_dropped} | "
+                    f"Duplicated: {metrics.frames_duplicated} | "
+                    f"Latency: {metrics.average_latency_ms:.1f}ms | "
+                    f"Buffer: {metrics.buffer_utilization:.0%}"
+                )
+            
+            if self.audio_optimizer:
+                audio_stats = self.audio_optimizer.get_stats()
+                buffer_mode = getattr(self.audio_optimizer, 'buffer_mode', None)
+                mode_str = buffer_mode.value if buffer_mode else "unknown"
+                logger.info(
+                    f"🎵 Audio [{mode_str}]: Buffer {audio_stats.current_buffer_ms:.0f}/{audio_stats.target_buffer_ms:.0f}ms | "
+                    f"Underruns: {audio_stats.buffer_underruns} | "
+                    f"Overruns: {audio_stats.buffer_overruns} | "
+                    f"Level: {audio_stats.average_level:.2f} | "
+                    f"Silence: {audio_stats.silence_ratio:.0%}"
+                )
+            
+            # LiveKit stats logging (simplified without publisher)
+            if hasattr(self, 'lk_room') and self.lk_room:
+                logger.info(
+                    f"📡 LiveKit: Connected and publishing | "
+                    f"Frame pacer: {self.frame_pacer.is_running if self.frame_pacer else 'N/A'} | "
+                    f"Audio optimizer: {'Active' if self.audio_optimizer else 'N/A'}"
+                )
+                
+            if self.av_synchronizer:
+                sync_status = self.av_synchronizer.get_sync_status()
+                status_icon = "✅" if sync_status['in_sync'] else "⚠️"
+                logger.info(
+                    f"{status_icon} A/V Sync: Drift {sync_status['drift_ms']:.1f}ms | "
+                    f"Offset: {sync_status['sync_offset_ms']:.1f}ms | "
+                    f"Frames: {sync_status['video_frames']} | "
+                    f"Samples: {sync_status['audio_samples']}"
+                )
+        except Exception as e:
+            logger.error(f"Error logging metrics: {e}")
     
     async def receive_avatar_frame_with_audio(self, timeout=1.5):
         """Receive protobuf frame and audio from SyncTalk"""
@@ -819,7 +1147,16 @@ class RapidoMainSystem:
                 
                 # Extract audio
                 if frame_msg.audio_bytes:
-                    avatar_audio = frame_msg.audio_bytes
+                    # Apply audio smoothing to fix crackling from 40ms chunk boundaries
+                    if self.audio_smoother:
+                        avatar_audio = self.audio_smoother.smooth_chunk(frame_msg.audio_bytes)
+                        # Log periodically
+                        if self._frame_count % 250 == 0:
+                            logger.debug(f"🔊 Audio smoother applied to {self.audio_smoother.chunk_count} chunks")
+                    else:
+                        avatar_audio = frame_msg.audio_bytes
+                else:
+                    avatar_audio = None
                 
                 return avatar_frame, avatar_audio
                     

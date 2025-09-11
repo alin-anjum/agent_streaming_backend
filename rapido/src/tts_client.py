@@ -12,13 +12,13 @@ logger = logging.getLogger(__name__)
 class ElevenLabsTTSClient:
     """Client for streaming TTS from ElevenLabs API."""
     
-    def __init__(self, api_key: str, voice_id: str = "pNInz6obpgDQGcFmaJgB"):
+    def __init__(self, api_key: str, voice_id: str = "lUTamkMw7gOzZbFIwmq4"):
         self.api_key = api_key
         self.voice_id = voice_id
         self.client = ElevenLabs(api_key=api_key)
         
         # TTS settings
-        self.model = "eleven_turbo_v2_5"
+        self.model = "eleven_multilingual_v2"
         self.output_format = "mp3_44100_128"
         
     async def stream_tts(self, text: str) -> AsyncGenerator[bytes, None]:
