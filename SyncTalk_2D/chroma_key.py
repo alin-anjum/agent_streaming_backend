@@ -143,7 +143,7 @@ class FastChromaKey:
                  width: int,
                  height: int,
                  background: np.ndarray,  # RGB array
-                 target_color: str = '#089831',
+                 target_color: str = '#bcfeb6',
                  color_threshold: int = 35,
                  edge_blur: float = 0.4,
                  despill_factor: float = 0.9,
