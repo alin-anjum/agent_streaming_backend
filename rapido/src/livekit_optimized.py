@@ -70,7 +70,7 @@ class LiveKitOptimizedPublisher:
                  livekit_url: str,
                  api_key: str,
                  api_secret: str,
-                 room_name: str = "avatar_room",
+                 room_name: str = "avatar-room2",
                  participant_name: str = "avatar_bot",
                  initial_quality: QualityLevel = QualityLevel.HIGH):
         """

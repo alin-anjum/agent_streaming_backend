@@ -121,7 +121,7 @@ class RapidoMainSystem:
                 setattr(self.config, key, value)
         
         # Setup paths and connections - use remote SyncTalk server
-        self.synctalk_url = getattr(self.config, 'SYNCTALK_WEBSOCKET_URL', 'ws://35.172.212.10:8000')
+        self.synctalk_url = getattr(self.config, 'SYNCTALK_WEBSOCKET_URL', 'ws://35.172.212.10:8000/ws')
         self.websocket = None
         self.aiohttp_session = None
         self.audio_send_queue = None
@@ -433,8 +433,8 @@ class RapidoMainSystem:
     async def connect_to_synctalk(self, avatar_name="enrique_torres", sample_rate=16000):
         """Connect to SyncTalk server using DECOUPLED architecture for maximum performance"""
         # Build optimized WebSocket URL with correct endpoint
-        base_url = self.synctalk_url.replace('ws://', 'http://').replace('wss://', 'https://')
-        ws_url = f"ws://{base_url.split('://', 1)[1]}/ws/audio_to_video"  # FIXED: Added /ws/ prefix
+        # Replace /ws with /ws/audio_to_video to get the correct endpoint
+        ws_url = self.synctalk_url.replace('/ws', '/ws/audio_to_video')
         params = {
             "avatar_name": avatar_name,
             "sample_rate": str(sample_rate)
@@ -560,9 +560,9 @@ class RapidoMainSystem:
             import time
             
             # LiveKit credentials
-            LIVEKIT_URL = "wss://agent-s83m6c4y.livekit.cloud"
-            LIVEKIT_API_KEY = "APIEkRN4enNfAzu"
-            LIVEKIT_API_SECRET = "jHEYfEfhaBWQg5isdDgO6e2Xw8zhIvb18KebGwH2ESXC"
+            LIVEKIT_URL = "wss://rapido-pme0lo9d.livekit.cloud"
+            LIVEKIT_API_KEY = "APImuXsSp8NH5jY"
+            LIVEKIT_API_SECRET = "6k9Swe5O6NxeI0WvVTCTrs2k1Ec25byeM4NlnTCKn5GB"
             
             # Generate JWT token
             current_time = int(time.time())
@@ -725,12 +725,12 @@ class RapidoMainSystem:
             import time
             
             # LiveKit credentials
-            LIVEKIT_URL = "wss://agent-s83m6c4y.livekit.cloud"
-            LIVEKIT_API_KEY = "APIEkRN4enNfAzu"
-            LIVEKIT_API_SECRET = "jHEYfEfhaBWQg5isdDgO6e2Xw8zhIvb18KebGwH2ESXC"
+            LIVEKIT_URL = "wss://rapido-pme0lo9d.livekit.cloud"
+            LIVEKIT_API_KEY = "APImuXsSp8NH5jY"
+            LIVEKIT_API_SECRET = "6k9Swe5O6NxeI0WvVTCTrs2k1Ec25byeM4NlnTCKn5GB"
             
             # Get room name from config
-            room_name = getattr(self.config, 'LIVEKIT_ROOM', 'avatar_room')
+            room_name = getattr(self.config, 'LIVEKIT_ROOM', 'avatar-room2')
             logger.info(f"🏠 Legacy LiveKit connecting to room: {room_name}")
             
             # Generate JWT token
