@@ -16,6 +16,8 @@ import sys
 import json
 import logging
 import websockets
+import aiohttp
+from urllib.parse import urlencode
 import cv2
 import numpy as np
 from pathlib import Path
@@ -121,6 +123,8 @@ class RapidoMainSystem:
         # Setup paths and connections - use remote SyncTalk server
         self.synctalk_url = getattr(self.config, 'SYNCTALK_WEBSOCKET_URL', 'ws://35.172.212.10:8000')
         self.websocket = None
+        self.aiohttp_session = None
+        self.audio_send_queue = None
         self.avatar_frames = []
         self.avatar_audio_chunks = []
         # Get the script directory and resolve paths relative to the project root
@@ -235,7 +239,23 @@ class RapidoMainSystem:
             self.audio_smoother = None
             logger.warning("⚠️ Running without optimization modules")
         
+        # Initialize buffering strategy configuration  
+        # REALITY-BASED: SyncTalk produces ~23.1 FPS, Frame pacer delivers ~17.7 FPS
+        self.buffer_config = {
+            'min_buffer_threshold': 75,    # Smaller buffer - faster startup
+            'min_buffer_level': 5,         # Very low threshold - we'll duplicate frames instead of pausing
+            'refill_target': 10,           # Not used - we don't refill during playback
+            'target_fps': 23.0,            # REALISTIC: Match SyncTalk's actual output (not 25!)
+            'max_timing_drift': 0.08,      # Max timing drift before reset (2 frame intervals)
+            'duplicate_when_empty': True,  # Duplicate last frame instead of pausing - SMOOTH PLAYBACK!
+            'max_composition_time_ms': 30, # Max acceptable composition time
+            'max_publish_time_ms': 40,     # Max acceptable publish time
+            'bypass_frame_pacer': False    # Fixed: Configure frame pacer properly instead of bypassing
+        }
+        
         logger.info(f"📊 Rapido initialized - Duration: {self.total_duration_seconds:.2f}s")
+        logger.info(f"📦 Buffer config: threshold={self.buffer_config['min_buffer_threshold']}, level={self.buffer_config['min_buffer_level']}, fps={self.buffer_config['target_fps']}")
+        logger.info(f"🎯 REALITY-BASED optimization: SyncTalk ~23 FPS, Frame pacer properly configured for 23 FPS")
     
     def __del__(self):
         """Cleanup thread pool on destruction"""
@@ -291,7 +311,7 @@ class RapidoMainSystem:
                 width=512,  # Match SyncTalk's actual output size after resize
                 height=512, # Match SyncTalk's actual output size after resize
                 background=background_color,  # Use beige background to match current frames
-                target_color='#089831',  # Correct green chroma key color
+                target_color='#bcfeb6',  # Match SyncTalk server green chroma key color
                 color_threshold=35,      # Match avatar config
                 edge_blur=0.4,          # Updated from config
                 despill_factor=0.9       # Updated from config
@@ -305,7 +325,7 @@ class RapidoMainSystem:
     def _remove_green_screen_for_transparency(self, image: Image.Image) -> Image.Image:
         """
         Optimized green screen removal for SyncTalk frames.
-        Creates transparency from green background (#089831).
+        Creates transparency from green background (#bcfeb6).
         """
         if image.mode != 'RGB':
             image = image.convert('RGB')
@@ -317,8 +337,8 @@ class RapidoMainSystem:
         img_array = np.array(image, dtype=np.uint8)
         height, width = img_array.shape[:2]
         
-        # SyncTalk's green screen color: #089831 = (8, 152, 49)
-        target_color = np.array([8, 152, 49], dtype=np.uint8)
+        # SyncTalk server's green screen color: #bcfeb6 = (188, 254, 182)
+        target_color = np.array([188, 254, 182], dtype=np.uint8)
         
         # Optimized green screen detection - use int16 for all calculations to avoid overflow
         img_int16 = img_array.astype(np.int16)
@@ -411,22 +431,111 @@ class RapidoMainSystem:
         return cv2.addWeighted(avatar_frame, 0.8, slide_frame, 0.2, 0)
     
     async def connect_to_synctalk(self, avatar_name="enrique_torres", sample_rate=16000):
-        """Connect to LOCAL SyncTalk server with protobuf support"""
-        ws_url = f"{self.synctalk_url}/audio_to_video?avatar_name={avatar_name}&sample_rate={sample_rate}"
-        logger.info(f"🔌 Connecting to LOCAL SyncTalk (ULTRA OPTIMIZED): {ws_url}")
+        """Connect to SyncTalk server using DECOUPLED architecture for maximum performance"""
+        # Build optimized WebSocket URL with correct endpoint
+        base_url = self.synctalk_url.replace('ws://', 'http://').replace('wss://', 'https://')
+        ws_url = f"ws://{base_url.split('://', 1)[1]}/ws/audio_to_video"  # FIXED: Added /ws/ prefix
+        params = {
+            "avatar_name": avatar_name,
+            "sample_rate": str(sample_rate)
+        }
+        full_url = f"{ws_url}?{urlencode(params)}"
+        
+        logger.info(f"🔌 Connecting to SyncTalk (DECOUPLED ARCHITECTURE): {full_url}")
         
         try:
-            self.websocket = await websockets.connect(ws_url)
-            logger.info("✅ Connected to SyncTalk!")
+            # Use aiohttp for better WebSocket performance
+            self.aiohttp_session = aiohttp.ClientSession()
+            self.websocket = await self.aiohttp_session.ws_connect(
+                full_url,
+                max_msg_size=10 * 1024 * 1024,  # 10MB max message size for performance
+                heartbeat=30  # Keep connection alive
+            )
+            
+            # Initialize audio queue for decoupled sending
+            self.audio_send_queue = asyncio.Queue(maxsize=1000)  # Much larger queue
+            
+            # Start separate audio processor for non-blocking sends
+            self.audio_processor_task = asyncio.create_task(self._audio_processor_loop())
+            
+            logger.info("✅ Connected to SyncTalk with DECOUPLED architecture!")
+            logger.info("🚀 Audio processor started - audio sending now non-blocking!")
             return True
         except Exception as e:
             logger.error(f"❌ Connection failed: {e}")
+            if self.aiohttp_session:
+                await self.aiohttp_session.close()
             return False
     
     async def send_audio_chunk(self, audio_data: bytes):
-        """Send audio to SyncTalk"""
-        if self.websocket:
-            await self.websocket.send(audio_data)
+        """Queue audio for non-blocking send to SyncTalk"""
+        if self.audio_send_queue:
+            try:
+                # Queue audio for sending - with better error handling
+                await self.audio_send_queue.put({
+                    "type": "audio", 
+                    "data": audio_data
+                })
+            except Exception as e:
+                logger.error(f"Failed to queue audio: {e}")
+                # Fallback to direct send if queue fails
+                if self.websocket:
+                    try:
+                        await self.websocket.send_bytes(audio_data)
+                    except Exception as send_error:
+                        logger.error(f"Direct audio send also failed: {send_error}")
+    
+    async def _audio_processor_loop(self):
+        """Separate audio processor loop - sends audio as fast as possible without blocking"""
+        audio_chunks_sent = 0
+        last_log_time = time.time()
+        
+        logger.info("🎵 Audio processor loop started - decoupled from frame processing")
+        
+        while True:
+            try:
+                # Get audio data from queue with timeout
+                try:
+                    audio_item = await asyncio.wait_for(self.audio_send_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # Check if we should continue
+                    if hasattr(self, 'frame_delivery_running') and not self.frame_delivery_running:
+                        break
+                    continue
+                
+                if audio_item["type"] == "audio":
+                    # Send audio immediately to SyncTalk using aiohttp WebSocket
+                    await self.websocket.send_bytes(audio_item["data"])
+                    audio_chunks_sent += 1
+                    
+                    # Debug log for first few sends
+                    if audio_chunks_sent <= 3:
+                        logger.info(f"🎵 Audio chunk {audio_chunks_sent} sent to SyncTalk ({len(audio_item['data'])} bytes)")
+                    
+                    # Log audio sending rate periodically
+                    current_time = time.time()
+                    if current_time - last_log_time > 3.0:
+                        elapsed = current_time - last_log_time
+                        audio_rate = audio_chunks_sent / elapsed
+                        queue_size = self.audio_send_queue.qsize()
+                        logger.info(f"🎵 AUDIO PROCESSOR: {audio_rate:.1f} chunks/sec sent | Queue: {queue_size}")
+                        audio_chunks_sent = 0
+                        last_log_time = current_time
+                        
+                elif audio_item["type"] == "end_stream":
+                    # Send end of stream marker
+                    await self.websocket.send_bytes(b"end_of_stream")
+                    logger.info("📡 End of stream marker sent via audio processor")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"CRITICAL: Audio processor loop error: {e}")
+                logger.error(f"Audio item type: {audio_item.get('type', 'unknown') if 'audio_item' in locals() else 'no item'}")
+                logger.error(f"WebSocket state: {self.websocket.closed if self.websocket else 'no websocket'}")
+                await asyncio.sleep(0.1)
+                continue
+                
+        logger.info("🎵 Audio processor loop stopped")
     async def connect_livekit(self):
         """Connect to LiveKit with optimized settings"""
         # Check if optimizations are available
@@ -466,7 +575,7 @@ class RapidoMainSystem:
                 "iat": current_time,
                 "jti": f"avatar_bot_{current_time}",
                 "video": {
-                    "room": "avatar_room",
+                    "room": room_name,  # FIXED: Use actual room name from config
                     "roomJoin": True,
                     "canPublish": True,
                     "canSubscribe": True
@@ -474,9 +583,14 @@ class RapidoMainSystem:
             }
             token = jwt.encode(token_payload, LIVEKIT_API_SECRET, algorithm="HS256")
             
-            # Connect to room using standard method
+            # Connect to room using standard method  
             self.lk_room = rtc.Room()
             await self.lk_room.connect(LIVEKIT_URL, token)
+            logger.info(f"✅ Connected to LiveKit room: {room_name}")
+            
+            # Log room connection details
+            logger.info(f"🎬 Publishing video track to room: {room_name}")
+            logger.info(f"🎵 Publishing audio track to room: {room_name}")
             
             # Create sources
             self.video_source = rtc.VideoSource(854, 480)
@@ -494,11 +608,11 @@ class RapidoMainSystem:
             logger.info("✅ Connected to LiveKit (legacy method)")
             
             # Now initialize optimization components on top of the basic connection
-            # Initialize frame pacer for consistent delivery with larger buffer
+            # Initialize frame pacer for consistent delivery - CONFIGURED FOR 23 FPS REALITY
             self.frame_pacer = AdaptiveFramePacer(
-                target_fps=25.0,
-                min_buffer_size=10,  # Increased from 5
-                max_buffer_size=50   # Increased from 20 for 2 seconds buffer
+                target_fps=23.0,        # FIXED: Match SyncTalk's actual output, not wishful 25 FPS
+                min_buffer_size=5,      # Smaller buffer for lower latency
+                max_buffer_size=25      # Optimized for 23 FPS (1 second buffer)
             )
             
             # Initialize audio optimizer with HIGH_QUALITY mode for stability
@@ -615,6 +729,10 @@ class RapidoMainSystem:
             LIVEKIT_API_KEY = "APIEkRN4enNfAzu"
             LIVEKIT_API_SECRET = "jHEYfEfhaBWQg5isdDgO6e2Xw8zhIvb18KebGwH2ESXC"
             
+            # Get room name from config
+            room_name = getattr(self.config, 'LIVEKIT_ROOM', 'avatar_room')
+            logger.info(f"🏠 Legacy LiveKit connecting to room: {room_name}")
+            
             # Generate JWT token
             current_time = int(time.time())
             token_payload = {
@@ -626,7 +744,7 @@ class RapidoMainSystem:
                 "iat": current_time,
                 "jti": f"avatar_bot_{current_time}",
                 "video": {
-                    "room": "avatar_room",
+                    "room": room_name,  # FIXED: Use actual room name from config
                     "roomJoin": True,
                     "canPublish": True,
                     "canSubscribe": True
@@ -637,6 +755,7 @@ class RapidoMainSystem:
             # Connect to room
             self.lk_room = rtc.Room()
             await self.lk_room.connect(LIVEKIT_URL, token)
+            logger.info(f"✅ Connected to LiveKit room: {room_name}")
             
             # Create sources
             self.video_source = rtc.VideoSource(854, 480)
@@ -668,10 +787,11 @@ class RapidoMainSystem:
         logger.info("🚀 Starting OPTIMIZED REAL-TIME ElevenLabs TTS streaming")
         tts_client = ElevenLabsTTSClient(api_key=api_key)
         
-        # Add frame buffer for smooth output with proper queue management
-        # INCREASED buffer size to prevent drops
-        self.frame_queue = asyncio.Queue(maxsize=50)  # 2 seconds buffer at 25 FPS
+        # Single queue buffering system optimized for 23fps reality
+        # Fast collection from SyncTalk, realistic timing control for output
+        self.intake_queue = asyncio.Queue(maxsize=200)  # Optimized buffer size for 23fps
         self.buffer_lock = asyncio.Lock()
+        self.last_frame_data = None  # Keep last frame for duplication when buffer empty
         
         # Frame delivery system for smooth playback
         self.frame_delivery_running = True
@@ -710,81 +830,20 @@ class RapidoMainSystem:
                 # Raw PCM from ElevenLabs - no conversion needed!
                 pcm_chunk = chunk_bytes  # Already 16kHz PCM int16 bytes
                 
-                # Send to SyncTalk immediately and track
+                # DECOUPLED: Queue audio immediately (non-blocking!)
                 await self.send_audio_chunk(pcm_chunk)
                 self.audio_chunks_sent += 1
-                
-                # Each 160ms chunk should produce ~4 frames at 25 FPS
-                # Try to collect multiple frames per chunk
-                frames_collected_this_chunk = 0
-                max_frames_to_collect = 4  # We expect up to 4 frames per 160ms chunk
-                
-                for _ in range(max_frames_to_collect):
-                    # Collect avatar frame with timeout
-                    frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.5)
-                    if frame and audio:
-                        # Track received frames for end marker timing
-                        self.frames_received += 1
-                        frames_collected_this_chunk += 1
-                        
-                        # MONITOR SYNCTALK PRODUCTION RATE - REAL-TIME FPS TRACKING
-                        self.synctalk_frame_count += 1
-                        current_time = time.time()
-
-                        if self.synctalk_start_time is None:
-                            self.synctalk_start_time = current_time
-                            self.synctalk_last_log_time = current_time
-                            self.synctalk_last_frame_count = 0
-
-                        # Log SyncTalk FPS every 3 seconds for real-time monitoring
-                        if current_time - self.synctalk_last_log_time >= 3.0:
-                            # Calculate recent FPS (last 3 seconds)
-                            recent_frames = self.synctalk_frame_count - self.synctalk_last_frame_count
-                            recent_fps = recent_frames / (current_time - self.synctalk_last_log_time)
-                            
-                            # Calculate overall FPS
-                            overall_fps = self.synctalk_frame_count / (current_time - self.synctalk_start_time)
-                            
-                            status = "🟢" if recent_fps >= 20 else "🟡" if recent_fps >= 10 else "🔴"
-                            logger.info(f"🤖 SYNCTALK FPS: {recent_fps:.1f} recent | {overall_fps:.1f} avg {status} (total: {self.synctalk_frame_count})")
-                            
-                            # Update for next calculation
-                            self.synctalk_last_log_time = current_time
-                            self.synctalk_last_frame_count = self.synctalk_frame_count
-                        
-                        # Add to queue for smooth continuous delivery
-                        # Use non-blocking put with overflow protection
-                        frame_data = {
-                            "type": "video",
-                            "frame": frame,
-                            "audio": audio,
-                            "timestamp": time.time()
-                        }
-                        
-                        try:
-                            # Non-blocking put - if queue is full, drop oldest frame
-                            self.frame_queue.put_nowait(frame_data)
-                        except asyncio.QueueFull:
-                            # Queue is full, remove oldest and add new frame
-                            try:
-                                self.frame_queue.get_nowait()  # Remove oldest
-                                self.frame_queue.put_nowait(frame_data)  # Add new
-                                logger.debug("🔄 Buffer overflow - dropped oldest frame")
-                            except asyncio.QueueEmpty:
-                                pass
-                        
-                        # Still collect for fallback
-                        self.avatar_frames.append(frame)
-                        self.avatar_audio_chunks.append(audio)
-                    else:
-                        # No more frames available for this chunk, break early
-                        break
                     
             except Exception as e:
                 logger.error(f"Error processing audio chunk: {e}")
         
-        # Start continuous frame delivery system
-        logger.info("🎬 Starting continuous frame delivery system...")
+        # Start DECOUPLED frame collection system
+        logger.info("🎬 Starting DECOUPLED frame collection and controlled output...")
+        
+        # Start independent frame collector (no blocking audio!)
+        self.frame_collector_task = asyncio.create_task(self._frame_collector_loop())
+        
+        # Start controlled output delivery
         self.frame_delivery_task = asyncio.create_task(
             self.continuous_frame_delivery(frame_processor)
         )
@@ -860,12 +919,12 @@ class RapidoMainSystem:
                         "timestamp": time.time()
                     }
                     try:
-                        self.frame_queue.put_nowait(frame_data)
+                        self.intake_queue.put_nowait(frame_data)
                     except asyncio.QueueFull:
-                        # Queue full, remove oldest and add new
+                        # Intake full, remove oldest and add new
                         try:
-                            self.frame_queue.get_nowait()
-                            self.frame_queue.put_nowait(frame_data)
+                            self.intake_queue.get_nowait()
+                            self.intake_queue.put_nowait(frame_data)
                         except:
                             pass
                     
@@ -889,55 +948,140 @@ class RapidoMainSystem:
         
         logger.info(f"📦 Collected {additional_frames_count} additional frames after TTS complete (total: {self.frames_received})")
         
-        # NOW send end marker after we're really done
+        # NOW send end marker after we're really done (via audio processor queue)
         logger.info("📡 Sending end marker to SyncTalk after collecting all frames...")
         try:
-            await self.websocket.send(b"end_of_stream")
-            logger.info("✅ End marker sent")
+            await self.audio_send_queue.put({"type": "end_stream"})
+            logger.info("✅ End marker queued for audio processor")
         except Exception as e:
-            logger.warning(f"Failed to send end marker: {e}")
+            logger.warning(f"Failed to queue end marker: {e}")
         
         # Now stop frame delivery gracefully
-        logger.info("🛑 Stopping frame delivery...")
+        logger.info("🛑 Stopping frame delivery system...")
         self.frame_delivery_running = False
         
-        # Drain any remaining frames from the queue before stopping
-        while not self.frame_queue.empty():
+        # Drain any remaining frames from intake queue before stopping            
+        while not self.intake_queue.empty():
             try:
-                await self.frame_queue.get()
+                await self.intake_queue.get() 
             except:
                 break
         
+        # Cancel all tasks
+        tasks_to_cancel = []
+        if hasattr(self, 'frame_collector_task') and self.frame_collector_task:
+            tasks_to_cancel.append(('Frame collector', self.frame_collector_task))
+        if hasattr(self, 'audio_processor_task') and self.audio_processor_task:
+            tasks_to_cancel.append(('Audio processor', self.audio_processor_task))
         if self.frame_delivery_task:
-            # Cancel the task instead of waiting for it to avoid blocking
-            self.frame_delivery_task.cancel()
+            tasks_to_cancel.append(('Frame delivery', self.frame_delivery_task))
+        
+        for task_name, task in tasks_to_cancel:
+            task.cancel()
             try:
-                await self.frame_delivery_task
+                await task
             except asyncio.CancelledError:
-                logger.info("✅ Frame delivery task cancelled successfully")
+                logger.info(f"✅ {task_name} task cancelled successfully")
+        
+        # Close aiohttp session
+        if self.aiohttp_session:
+            await self.aiohttp_session.close()
+            logger.info("✅ aiohttp session closed")
         
         return True
     
     async def continuous_frame_delivery(self, frame_processor):
-        """Stream frames as fast as possible from queue - following working service pattern"""
+        """Stream frames with buffering strategy to maintain steady 25fps output"""
         try:
             slide_frame_index = 0
             frame_count = 0
             
-            logger.info("🎬 Continuous frame delivery started - PULL-BASED STREAMING")
+            # Buffering configuration - use configurable values
+            min_buffer_threshold = self.buffer_config['min_buffer_threshold']
+            min_buffer_level = self.buffer_config['min_buffer_level']
+            refill_target = self.buffer_config['refill_target']
+            target_fps = self.buffer_config['target_fps']
+            max_timing_drift = self.buffer_config['max_timing_drift']
+            frame_interval = 1.0 / target_fps  # ~0.043 seconds = 43.5ms per frame at 23fps
+            
+            logger.info(f"🎬 Output delivery started - waiting for {min_buffer_threshold} frame intake buffer")
+            logger.info(f"⏱️ Performance targets: Composition <{self.buffer_config['max_composition_time_ms']}ms | Publish <{self.buffer_config['max_publish_time_ms']}ms")
+            logger.info(f"🎯 REALITY-BASED: Target {target_fps} FPS to match SyncTalk actual performance")
             self.frame_delivery_start_time = time.time()
+            
+            # Phase 1: Wait for buffer to fill above threshold
+            buffer_filled = False
+            buffer_wait_start = time.time()
+            
+            while self.frame_delivery_running and not buffer_filled:
+                intake_size = self.intake_queue.qsize()
+                
+                if intake_size >= min_buffer_threshold:
+                    buffer_filled = True
+                    buffer_wait_time = time.time() - buffer_wait_start
+                    logger.info(f"🎬 ✅ Intake buffer filled! {intake_size} frames ready after {buffer_wait_time:.1f}s - starting steady {target_fps}fps output")
+                    break
+                
+                # Log buffer filling progress every 2 seconds
+                if int(time.time() - buffer_wait_start) % 2 == 0:
+                    elapsed = time.time() - buffer_wait_start
+                    if elapsed > 1:  # Only log after first second
+                        logger.info(f"🎬 📦 Intake buffer: {intake_size}/{min_buffer_threshold} frames ({elapsed:.1f}s elapsed)")
+                
+                # Wait a bit before checking again
+                await asyncio.sleep(0.5)
+            
+            if not buffer_filled:
+                logger.warning("🎬 ⚠️ Frame delivery stopped before buffer was filled")
+                return
+            
+            # Phase 2: Steady 25fps output with buffer monitoring
+            # Use high-precision timing for exactly 25fps
+            next_frame_time = time.time()
+            frames_output = 0
+            last_timing_log = time.time()
+            
+            # Reset frame delivery start time AFTER buffer fills for accurate FPS measurement
+            self.frame_delivery_start_time = time.time()
+            frame_count = 0  # Reset counter for accurate sustained FPS
+            
+            # Detailed output rate tracking
+            output_rate_start = time.time()
+            output_rate_count = 0
+            duplicated_count = 0
+            real_frame_count = 0
             
             while self.frame_delivery_running:
                 try:
-                    # Get frame from queue with timeout to allow checking frame_delivery_running
-                    # This prevents indefinite blocking when we need to stop
+                    # PRECISE 25fps timing - wait until exactly the right time
+                    current_time = time.time()
+                    if current_time < next_frame_time:
+                        sleep_time = next_frame_time - current_time
+                        # Use precise sleep for timing accuracy
+                        if sleep_time > 0.001:  # Only sleep if > 1ms
+                            await asyncio.sleep(sleep_time)
+                    
+                    # Get frame DIRECTLY from intake (single timing control)
+                    intake_size = self.intake_queue.qsize()
+                    is_duplicated_frame = False
+                    
                     try:
-                        frame_data = await asyncio.wait_for(self.frame_queue.get(), timeout=0.5)
-                    except asyncio.TimeoutError:
-                        # Check if we should continue or stop
-                        if not self.frame_delivery_running:
-                            break
-                        continue
+                        frame_data = self.intake_queue.get_nowait()
+                        self.last_frame_data = frame_data  # Save for potential duplication
+                        real_frame_count += 1
+                    except asyncio.QueueEmpty:
+                        # Intake empty - duplicate last frame for smooth playback (NO PAUSES!)
+                        if self.last_frame_data is not None:
+                            frame_data = self.last_frame_data.copy()  # Duplicate last frame
+                            is_duplicated_frame = True
+                            duplicated_count += 1
+                            if intake_size == 0:  # Only log first time intake goes empty
+                                logger.info(f"🎬 🔄 Intake empty - duplicating last frame for smooth playback")
+                        else:
+                            # No previous frame available, skip this cycle
+                            logger.warning("🎬 ⚠️ No frames available and no previous frame to duplicate")
+                            next_frame_time += frame_interval
+                            continue
                     
                     if frame_data["type"] == "video":
                         frame = frame_data["frame"]
@@ -965,7 +1109,8 @@ class RapidoMainSystem:
                                 logger.info(f"🎬 STATIC: Using frame processor {safe_slide_index}/{current_frame_count}, dynamic_count={self.slide_frame_count}")
                         
                         if slide_frame:
-                            # FAST COMPOSITION - minimal processing
+                            # FAST COMPOSITION with performance tracking
+                            composition_start = time.time()
                             composed_frame = frame_processor.overlay_avatar_on_slide(
                                 slide_frame=slide_frame,
                                 avatar_frame=frame,
@@ -973,39 +1118,120 @@ class RapidoMainSystem:
                                 scale=0.6,
                                 offset=(0, 0)  # No offset needed - center-bottom handles positioning
                             )
+                            composition_duration = (time.time() - composition_start) * 1000
                             
                             # Convert to BGR for video publishing
+                            conversion_start = time.time()
                             cv_frame = cv2.cvtColor(np.array(composed_frame), cv2.COLOR_RGB2BGR)
+                            conversion_duration = (time.time() - conversion_start) * 1000
                             
                             # Convert audio for LiveKit
                             pcm_audio = audio if isinstance(audio, bytes) else (audio * 32767).astype('int16').tobytes()
                             
-                            # Publish to LiveKit immediately - no artificial delays
+                            # Track slow operations
+                            max_composition_ms = self.buffer_config['max_composition_time_ms']
+                            if composition_duration > max_composition_ms:
+                                logger.warning(f"🐌 Slow composition: {composition_duration:.1f}ms (target: <{max_composition_ms}ms)")
+                            if conversion_duration > 10:
+                                logger.warning(f"🐌 Slow BGR conversion: {conversion_duration:.1f}ms")
+                            
+                            # Publish to LiveKit at precise timing with performance measurement
+                            publish_start = time.time()
                             await self.publish_frame_to_livekit(cv_frame, pcm_audio)
+                            publish_duration = (time.time() - publish_start) * 1000  # Convert to milliseconds
+                            
+                            # Track publishing performance
+                            if not hasattr(self, '_publish_times'):
+                                self._publish_times = []
+                            self._publish_times.append(publish_duration)
+                            
+                            # Log slow publishing
+                            max_publish_ms = self.buffer_config['max_publish_time_ms']
+                            if publish_duration > max_publish_ms:
+                                logger.warning(f"🐌 Slow publish: {publish_duration:.1f}ms (target: <{max_publish_ms}ms for 25fps)")
                             
                             # Advance counters
                             slide_frame_index += 1
                             frame_count += 1
+                            frames_output += 1
+                            output_rate_count += 1
                             
-                            # Log progress
+                            # Set next frame time for precise 25fps - CRITICAL timing
+                            next_frame_time += frame_interval
+                            
+                            # Handle timing drift - if we're more than max_timing_drift behind, reset
+                            current_time = time.time()
+                            if next_frame_time < current_time - max_timing_drift:
+                                drift_amount = current_time - next_frame_time
+                                next_frame_time = current_time + frame_interval
+                                logger.debug(f"🎬 🔄 Reset frame timing due to {drift_amount*1000:.1f}ms drift")
+                            
+                            # Log detailed output rate every 3 seconds
+                            if current_time - last_timing_log > 3.0:
+                                time_elapsed = current_time - last_timing_log
+                                actual_output_fps = frames_output / time_elapsed
+                                timing_accuracy = (actual_output_fps / target_fps) * 100
+                                status_icon = "✅" if abs(actual_output_fps - target_fps) < 0.5 else "⚠️"
+                                
+                                # Calculate output rate metrics
+                                total_output_elapsed = current_time - output_rate_start
+                                total_output_fps = output_rate_count / total_output_elapsed if total_output_elapsed > 0 else 0
+                                real_fps = real_frame_count / total_output_elapsed if total_output_elapsed > 0 else 0
+                                duplicate_fps = duplicated_count / total_output_elapsed if total_output_elapsed > 0 else 0
+                                duplicate_ratio = (duplicated_count / output_rate_count * 100) if output_rate_count > 0 else 0
+                                
+                                # Calculate pipeline performance
+                                if hasattr(self, '_publish_times') and self._publish_times:
+                                    avg_publish_time = sum(self._publish_times) / len(self._publish_times)
+                                    max_publish_time = max(self._publish_times)
+                                    slow_publishes = len([t for t in self._publish_times if t > 40])
+                                    slow_ratio = (slow_publishes / len(self._publish_times)) * 100
+                                    self._publish_times = []  # Reset for next period
+                                else:
+                                    avg_publish_time = 0
+                                    max_publish_time = 0
+                                    slow_ratio = 0
+                                
+                                logger.info(f"🎬 {status_icon} PRECISE OUTPUT: {actual_output_fps:.2f}/{target_fps} FPS ({timing_accuracy:.1f}% accuracy)")
+                                logger.info(f"📊 OUTPUT BREAKDOWN: Total: {total_output_fps:.1f} FPS | Real: {real_fps:.1f} | Duplicated: {duplicate_fps:.1f} ({duplicate_ratio:.1f}%)")
+                                logger.info(f"⏱️ PIPELINE TIMING: Avg: {avg_publish_time:.1f}ms | Max: {max_publish_time:.1f}ms | Slow: {slow_ratio:.1f}% (target: <{self.buffer_config['max_publish_time_ms']}ms)")
+                                
+                                # Log frame pacer configuration status
+                                if hasattr(self, 'frame_pacer') and self.frame_pacer:
+                                    pacer_fps = self.frame_pacer.target_fps
+                                    logger.info(f"🔄 FRAME PACER: Configured for {pacer_fps} FPS (matching SyncTalk reality)")
+                                
+                                frames_output = 0
+                                last_timing_log = current_time
+                            
+                            # Log progress and performance
                             if frame_count % 50 == 0:
                                 cycle_count = slide_frame_index // self.total_slide_frames if self.total_slide_frames > 0 else 0
                                 current_slide = safe_slide_index
                                 cache_indicator = " - CACHED" if self.use_dynamic_capture else ""
                                 logger.info(f"📊 Slide progress: {current_slide}/{self.total_slide_frames} (cycle {cycle_count + 1}, frame {frame_count}){cache_indicator}")
                             
-                            if frame_count % 25 == 0:  # Log every second
-                                current_time = time.time()
-                                queue_size = self.frame_queue.qsize()
+                            if frame_count % 25 == 0:  # Log every second  
                                 elapsed_time = current_time - self.frame_delivery_start_time
-                                actual_fps = frame_count / elapsed_time
-                                target_fps = 25.0
-                                fps_diff = actual_fps - target_fps
-                                status = "✅" if abs(fps_diff) < 2.0 else "⚠️"
-                                logger.info(f"🎬 {status} FPS: {actual_fps:.1f}/{target_fps} (diff: {fps_diff:+.1f}), queue: {queue_size}")
+                                sustained_fps = frame_count / elapsed_time if elapsed_time > 0 else 0
+                                fps_diff = sustained_fps - target_fps
+                                status = "✅" if abs(fps_diff) < 1.0 else "⚠️"
+                                
+                                # New color coding for intake buffer status
+                                if intake_size > 30:
+                                    buffer_status = "🟢"  # Plenty of buffer
+                                elif intake_size > 10:
+                                    buffer_status = "🟡"  # Getting low but still safe
+                                elif intake_size > 0:
+                                    buffer_status = "🟠"  # Very low but still have frames
+                                else:
+                                    buffer_status = "🔄"  # Duplicating frames
+                                logger.info(f"🎬 {status} SUSTAINED: {sustained_fps:.1f}/{target_fps} FPS (diff: {fps_diff:+.1f}) {buffer_status} intake: {intake_size} frames")
                         
-                        # Mark task as done
-                        self.frame_queue.task_done()
+                        # Mark task as done - frame successfully processed and output
+                        # Only mark as done if we actually got a frame from intake (not duplicated)
+                        if not is_duplicated_frame:
+                            self.intake_queue.task_done()
                         
                 except asyncio.CancelledError:
                     break
@@ -1014,19 +1240,122 @@ class RapidoMainSystem:
                     continue
                 
         except Exception as e:
-            logger.error(f"Error in continuous frame delivery: {e}")
+            logger.error(f"Error in buffered frame delivery: {e}")
         
-        logger.info("🎬 Continuous frame delivery stopped")
+        logger.info("🎬 Buffered frame delivery stopped")
+    
+    async def _frame_collector_loop(self):
+        """Independent frame collector - runs continuously without blocking audio"""
+        logger.info("🎬 Frame collector started - collecting frames independently from audio")
+        
+        frame_collection_count = 0
+        collection_start_time = time.time()
+        
+        while self.frame_delivery_running:
+            try:
+                # Collect frames as fast as SyncTalk produces them
+                frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.1)
+                
+                if frame and audio:
+                    # Track received frames for monitoring
+                    self.frames_received += 1
+                    frame_collection_count += 1
+                    
+                    # MONITOR SYNCTALK PRODUCTION RATE
+                    self.synctalk_frame_count += 1
+                    if self.synctalk_start_time is None:
+                        self.synctalk_start_time = time.time()
+                    
+                    # Log SyncTalk production rate every 25 frames
+                    if self.synctalk_frame_count % 25 == 0:
+                        elapsed = time.time() - self.synctalk_start_time
+                        synctalk_fps = self.synctalk_frame_count / elapsed
+                        fps_status = "✅" if synctalk_fps >= 24.0 else "⚠️"
+                        logger.info(f"🤖 SYNCTALK DECOUPLED: {fps_status} {synctalk_fps:.1f} FPS (no backpressure!)")
+                        
+                        # Calculate decoupling benefit
+                        current_time = time.time()
+                        collection_elapsed = current_time - collection_start_time
+                        collection_rate = frame_collection_count / collection_elapsed if collection_elapsed > 0 else 0
+                        if collection_rate > synctalk_fps * 1.1:
+                            logger.info(f"🚀 DECOUPLING BENEFIT: Collecting at {collection_rate:.1f} FPS vs SyncTalk {synctalk_fps:.1f} FPS")
+                    
+                    # Add to queue for smooth continuous delivery
+                    frame_data = {
+                        "type": "video",
+                        "frame": frame,
+                        "audio": audio,
+                        "timestamp": time.time()
+                    }
+                    
+                    try:
+                        # Add to fast intake queue
+                        self.intake_queue.put_nowait(frame_data)
+                    except asyncio.QueueFull:
+                        # Intake full, drop oldest frame
+                        try:
+                            self.intake_queue.get_nowait()  # Remove oldest
+                            self.intake_queue.put_nowait(frame_data)  # Add new
+                            logger.debug("🔄 Intake overflow - dropped oldest frame")
+                        except asyncio.QueueEmpty:
+                            pass
+                    
+                    # Still collect for fallback
+                    self.avatar_frames.append(frame)
+                    self.avatar_audio_chunks.append(audio)
+                    
+            except asyncio.TimeoutError:
+                # No frames available right now - continue collecting
+                continue
+            except Exception as e:
+                logger.error(f"Error in frame collector: {e}")
+                await asyncio.sleep(0.1)
+                continue
+        
+        logger.info("🎬 Frame collector stopped")
+    
+    def configure_buffer_strategy(self, **kwargs):
+        """
+        Configure buffering strategy parameters.
+        
+        Args:
+            min_buffer_threshold (int): Minimum frames to wait before starting output (default: 30)
+            min_buffer_level (int): Minimum frames to maintain during playback (default: 10)
+            refill_target (int): Target frames when refilling buffer (default: 20)
+            target_fps (float): Target output frame rate (default: 25.0)
+            max_timing_drift (float): Max timing drift before reset in seconds (default: 0.08)
+        """
+        valid_keys = {
+            'min_buffer_threshold', 'min_buffer_level', 'refill_target', 
+            'target_fps', 'max_timing_drift'
+        }
+        
+        for key, value in kwargs.items():
+            if key in valid_keys:
+                old_value = self.buffer_config.get(key, 'N/A')
+                self.buffer_config[key] = value
+                logger.info(f"📦 Buffer config updated: {key}={old_value} → {value}")
+            else:
+                logger.warning(f"⚠️ Invalid buffer config key: {key}")
+        
+        # Validate configuration
+        if self.buffer_config['min_buffer_level'] >= self.buffer_config['min_buffer_threshold']:
+            logger.warning("⚠️ min_buffer_level should be less than min_buffer_threshold")
+        
+        if self.buffer_config['refill_target'] > self.buffer_config['min_buffer_threshold']:
+            logger.warning("⚠️ refill_target should not exceed min_buffer_threshold")
+        
+        logger.info(f"📦 Current buffer config: {self.buffer_config}")
     
     async def publish_frame_to_livekit(self, bgr_frame, audio_chunk):
-        """Publish frame and audio to LiveKit with optimizations if available"""
-        # Check if optimizations are available and initialized
+        """Publish frame and audio to LiveKit with properly configured optimizations"""
+        # Check if optimizations are available and properly configured
         use_optimized = (OPTIMIZATIONS_AVAILABLE and 
                         hasattr(self, 'frame_pacer') and self.frame_pacer and
                         hasattr(self, 'audio_optimizer') and self.audio_optimizer)
         
         if use_optimized:
-            # Convert BGR to RGB for optimized path
+            # Convert BGR to RGB for optimized path with FIXED frame pacer
             rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
             return await self.publish_frame_to_livekit_optimized(rgb_frame, audio_chunk)
         else:
@@ -1181,9 +1510,15 @@ class RapidoMainSystem:
             logger.error(f"Error logging metrics: {e}")
     
     async def receive_avatar_frame_with_audio(self, timeout=1.5):
-        """Receive protobuf frame and audio from SyncTalk"""
+        """Receive protobuf frame and audio from SyncTalk using aiohttp WebSocket"""
         try:
-            protobuf_data = await asyncio.wait_for(self.websocket.recv(), timeout=timeout)
+            # Use aiohttp WebSocket receive
+            msg = await asyncio.wait_for(self.websocket.receive(), timeout=timeout)
+            
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                protobuf_data = msg.data
+            else:
+                return None, None
             
             if isinstance(protobuf_data, bytes):
                 frame_msg = FrameMessage()
@@ -1196,20 +1531,36 @@ class RapidoMainSystem:
                 if frame_msg.video_bytes:
                     video_data = np.frombuffer(frame_msg.video_bytes, dtype=np.uint8)
                     
-                    # Handle different frame sizes
+                    # Handle different frame sizes - optimized for performance
                     if len(video_data) == 512 * 512 * 3:
                         frame_array = video_data.reshape((512, 512, 3))
                     elif len(video_data) == 350 * 350 * 3:
                         frame_array = video_data.reshape((350, 350, 3))
+                    elif len(video_data) == 256 * 256 * 3:
+                        frame_array = video_data.reshape((256, 256, 3))
+                    elif len(video_data) == 128 * 128 * 3:
+                        frame_array = video_data.reshape((128, 128, 3))
+                    elif len(video_data) == 64 * 64 * 3:
+                        frame_array = video_data.reshape((64, 64, 3))
                     else:
                         total_pixels = len(video_data) // 3
                         side = int(np.sqrt(total_pixels))
                         if side * side * 3 == len(video_data):
                             frame_array = video_data.reshape((side, side, 3))
                         else:
+                            logger.warning(f"🔍 Unexpected frame size: {len(video_data)} bytes ({total_pixels} pixels)")
                             return None, None
                     
                     avatar_frame = Image.fromarray(frame_array, 'RGB')
+                    
+                    # Upscale ALL smaller frames to 512x512 for consistent processing and quality
+                    original_size = frame_array.shape[:2]
+                    if original_size != (512, 512):
+                        avatar_frame = avatar_frame.resize((512, 512), Image.LANCZOS)
+                        if self._frame_count < 3:
+                            logger.info(f"🔍 Upscaling {original_size[0]}x{original_size[1]} → 512x512 using LANCZOS interpolation")
+                    elif self._frame_count < 3:
+                        logger.info(f"🔍 Frame already 512x512, no upscaling needed")
                     
                     # Apply green screen removal for transparency (async for better performance)
                     try:
@@ -1243,8 +1594,8 @@ class RapidoMainSystem:
     
     def _remove_green_screen_for_transparency_alin(self, image: Image.Image) -> Image.Image:
         """
-         Optimized green screen removal for alin avatar with light green background.
-         Creates transparency from chroma key color (#C2FFB6).
+        Optimized green screen removal for alin avatar with green background.
+        Creates transparency from chroma key color (#bcfeb6).
         """
         if image.mode != 'RGB':
             image = image.convert('RGB')
@@ -1264,13 +1615,16 @@ class RapidoMainSystem:
                 # Convert to tensor and move to GPU
                 img_tensor = torch.from_numpy(img_array).float().to(self.device)
                 
-                # Chroma key color: #C2FFB6 = (194, 255, 182) - light green background
-                target_color = torch.tensor([194.0, 255.0, 182.0], device=self.device)
+                # Chroma key color: #bcfeb6 = (188, 254, 182)
+                target_color = torch.tensor([188.0, 254.0, 182.0], device=self.device)
                 
                 # Extract RGB channels
                 r, g, b = img_tensor[:, :, 0], img_tensor[:, :, 1], img_tensor[:, :, 2]
                 
-                # GPU-accelerated color similarity calculation for light green #C2FFB6
+                # GPU-accelerated green detection for #bcfeb6 (lighter green)
+                green_dominant = (g > r + 20) & (g > b + 20)  # Green must be significantly higher
+                
+                # GPU-accelerated color similarity calculation
                 color_diff = torch.sqrt(
                     (r - target_color[0]) ** 2 +
                     (g - target_color[1]) ** 2 +
@@ -1301,7 +1655,7 @@ class RapidoMainSystem:
             except Exception as e:
                 logger.debug(f"GPU chroma key failed, using CPU: {e}")
                 # Fallback to CPU processing
-                target_color = np.array([194, 255, 182], dtype=np.uint8)
+                target_color = np.array([188, 254, 182], dtype=np.uint8)
                 r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
                 
                 color_diff = np.sqrt(
@@ -1550,8 +1904,8 @@ class RapidoMainSystem:
         
         img_array = np.array(image, dtype=np.float32)
         
-        # Green screen color from SyncTalk config: #089831 = (8, 152, 49)
-        target_color = np.array([8, 152, 49], dtype=np.float32)
+        # Green screen color from SyncTalk server: #bcfeb6 = (188, 254, 182)
+        target_color = np.array([188, 254, 182], dtype=np.float32)
         color_threshold = 30  # Lowered from 35 to catch more green
         despill_factor = 0.8  # Increased from 0.5 to be more aggressive
         edge_blur = 0.08
@@ -1860,8 +2214,15 @@ class RapidoMainSystem:
                 except Exception as e:
                     logger.warning(f"⚠️ Error stopping slide producer task: {e}")
             
+            # Cleanup connections properly
+            if hasattr(self, 'audio_processor_task') and self.audio_processor_task:
+                self.audio_processor_task.cancel()
+            if hasattr(self, 'frame_collector_task') and self.frame_collector_task:
+                self.frame_collector_task.cancel()
             if self.websocket:
                 await self.websocket.close()
+            if self.aiohttp_session:
+                await self.aiohttp_session.close()
 
 def check_synctalk_server():
     """Verify SyncTalk server is running"""
