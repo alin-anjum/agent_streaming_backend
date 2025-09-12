@@ -302,6 +302,7 @@ async def generate_livekit_token_endpoint(request: LiveKitTokenRequest):
         livekit_url = "wss://agent-s83m6c4y.livekit.cloud"
         
         logger.info(f"✅ Token generated for {participant_name} (user: {request.userId}, session: {request.sessionId}) in lesson room {room_name}")
+        logger.info(f"💬 Frontend can send stop command: send(new TextEncoder().encode(JSON.stringify({{message: 'stop'}})))")
         
         # Step 3: Smart room management - only start avatar if room doesn't have one
         if await should_start_avatar_in_room(room_name):
@@ -421,6 +422,18 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         if success:
             session_info["status"] = "completed"
             logger.info(f"✅ Presentation completed for lesson: {lesson_id}")
+            
+            # Send stream ended event to frontend if possible
+            if hasattr(rapido, 'send_stream_event_to_frontend'):
+                try:
+                    await rapido.send_stream_event_to_frontend(
+                        "stream_ended",
+                        message="Avatar presentation has completed successfully",
+                        lesson_id=lesson_id,
+                        video_job_id=video_job_id
+                    )
+                except Exception as event_error:
+                    logger.error(f"Failed to send stream_ended event: {event_error}")
         else:
             session_info["status"] = "failed"
             logger.error(f"❌ Presentation failed for lesson: {lesson_id}")

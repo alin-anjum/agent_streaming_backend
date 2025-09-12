@@ -678,6 +678,9 @@ class RapidoMainSystem:
             logger.info(f"Frame pacer running: {self.frame_pacer.is_running}")
             logger.info(f"Audio optimizer initialized: {self.audio_optimizer is not None}")
             
+            # Setup data channel for stream control commands
+            await self.setup_stream_control_listener()
+            
             return True
             
         except Exception as e:
@@ -739,6 +742,10 @@ class RapidoMainSystem:
             self.audio_publication = await self.lk_room.local_participant.publish_track(audio_track, audio_options)
             
             logger.info("✅ Connected to LiveKit (legacy mode)!")
+            
+            # Setup data channel for stream control commands
+            await self.setup_stream_control_listener()
+            
             return True
             
         except Exception as e:
@@ -977,6 +984,14 @@ class RapidoMainSystem:
                     buffer_filled = True
                     buffer_wait_time = time.time() - buffer_wait_start
                     logger.info(f"🎬 ✅ Intake buffer filled! {intake_size} frames ready after {buffer_wait_time:.1f}s - starting steady {target_fps}fps output")
+                    
+                    # Send stream started event to frontend
+                    await self.send_stream_event_to_frontend(
+                        "stream_started", 
+                        message="Avatar presentation stream has started",
+                        target_fps=target_fps,
+                        buffer_size=intake_size
+                    )
                     break
                 
                 # Log buffer filling progress every 2 seconds
@@ -1182,6 +1197,116 @@ class RapidoMainSystem:
             logger.error(f"Error in buffered frame delivery: {e}")
         
         logger.info("🎬 Buffered frame delivery stopped")
+    
+    async def setup_stream_control_listener(self):
+        """Setup data channel listener for stream control commands from frontend"""
+        try:
+            if not hasattr(self, 'lk_room') or not self.lk_room:
+                logger.warning("⚠️ Cannot setup data channel - LiveKit room not available")
+                return
+            
+            @self.lk_room.on("data_received")
+            def handle_control_command(data_packet):
+                try:
+                    import json
+                    # Decode the TextEncoder().encode() format from frontend
+                    command_data = json.loads(data_packet.data.decode('utf-8'))
+                    user_identity = data_packet.participant.identity
+                    
+                    # Extract fields from frontend format
+                    message_id = command_data.get("id", "unknown")
+                    message = command_data.get("message", "").lower().strip()
+                    timestamp = command_data.get("timestamp", 0)
+                    
+                    logger.info(f"📨 Control command from {user_identity}: '{message}' (id: {message_id}, timestamp: {timestamp})")
+                    
+                    # Handle STOP command
+                    if message == "stop":
+                        logger.info("🛑 STOP command received - terminating avatar stream immediately")
+                        logger.info(f"🔍 Command details: ID={message_id}, from={user_identity}")
+                        asyncio.create_task(self.terminate_stream_immediately())
+                    else:
+                        logger.info(f"🔍 Unknown command: '{message}' - ignoring (ID: {message_id})")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing control command: {e}")
+                    logger.error(f"Raw data: {data_packet.data}")
+                    try:
+                        logger.error(f"Decoded data: {data_packet.data.decode('utf-8', errors='replace')}")
+                    except:
+                        pass
+            
+            logger.info("📡 Stream control listener setup complete - ready for 'stop' commands")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup stream control listener: {e}")
+    
+    async def terminate_stream_immediately(self):
+        """Immediately terminate the avatar stream when stop command received"""
+        try:
+            logger.info("🛑 Terminating avatar stream immediately...")
+            
+            # Send stream stopped event to frontend first
+            await self.send_stream_event_to_frontend(
+                "stream_stopped",
+                message="Avatar presentation stopped by user command"
+            )
+            
+            # Stop all streaming processes
+            self.frame_delivery_running = False
+            self.tts_streaming_complete = True
+            
+            # Stop audio processor if running
+            if hasattr(self, 'audio_processor_task') and self.audio_processor_task:
+                self.audio_processor_task.cancel()
+                logger.info("🛑 Audio processor stopped")
+            
+            # Stop frame collector if running  
+            if hasattr(self, 'frame_collector_task') and self.frame_collector_task:
+                self.frame_collector_task.cancel()
+                logger.info("🛑 Frame collector stopped")
+            
+            # Close SyncTalk connection
+            if self.websocket:
+                await self.websocket.close()
+                logger.info("🛑 SyncTalk connection closed")
+            
+            # Close aiohttp session
+            if hasattr(self, 'aiohttp_session') and self.aiohttp_session:
+                await self.aiohttp_session.close()
+                logger.info("🛑 aiohttp session closed")
+            
+            logger.info("✅ Avatar stream terminated successfully by user command")
+            
+        except Exception as e:
+            logger.error(f"Error during stream termination: {e}")
+    
+    async def send_stream_event_to_frontend(self, event_type: str, **event_data):
+        """Send stream events to frontend via LiveKit data channel"""
+        try:
+            if not hasattr(self, 'lk_room') or not self.lk_room:
+                logger.warning("⚠️ Cannot send event - LiveKit room not available")
+                return
+            
+            # Create event in same format as frontend expects
+            event_message = {
+                "id": f"avatar_event_{int(time.time() * 1000)}",
+                "event": event_type,
+                "timestamp": int(time.time() * 1000),
+                **event_data
+            }
+            
+            # Encode same way as frontend  
+            import json
+            data = json.dumps(event_message).encode('utf-8')
+            
+            # Send to all participants via data channel on "control" topic (same as frontend listens)
+            await self.lk_room.local_participant.publish_data(data, topic="control")
+            
+            logger.info(f"📤 Sent event to frontend: {event_type} (id: {event_message['id']})")
+            
+        except Exception as e:
+            logger.error(f"Failed to send stream event: {e}")
     
     async def _frame_collector_loop(self):
         """Independent frame collector - runs continuously without blocking audio"""
