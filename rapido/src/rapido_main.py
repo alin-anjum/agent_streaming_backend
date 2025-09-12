@@ -400,9 +400,9 @@ class RapidoMainSystem:
     
     async def connect_to_synctalk(self, avatar_name="enrique_torres", sample_rate=16000):
         """Connect to SyncTalk server using DECOUPLED architecture for maximum performance"""
-        # Build optimized WebSocket URL
+        # Build optimized WebSocket URL with correct endpoint
         base_url = self.synctalk_url.replace('ws://', 'http://').replace('wss://', 'https://')
-        ws_url = f"ws://{base_url.split('://', 1)[1]}/audio_to_video"
+        ws_url = f"ws://{base_url.split('://', 1)[1]}/ws/audio_to_video"  # FIXED: Added /ws/ prefix
         params = {
             "avatar_name": avatar_name,
             "sample_rate": str(sample_rate)
@@ -543,7 +543,7 @@ class RapidoMainSystem:
                 "iat": current_time,
                 "jti": f"avatar_bot_{current_time}",
                 "video": {
-                    "room": "avatar_room",
+                    "room": room_name,  # FIXED: Use actual room name from config
                     "roomJoin": True,
                     "canPublish": True,
                     "canSubscribe": True
@@ -551,9 +551,14 @@ class RapidoMainSystem:
             }
             token = jwt.encode(token_payload, LIVEKIT_API_SECRET, algorithm="HS256")
             
-            # Connect to room using standard method
+            # Connect to room using standard method  
             self.lk_room = rtc.Room()
             await self.lk_room.connect(LIVEKIT_URL, token)
+            logger.info(f"✅ Connected to LiveKit room: {room_name}")
+            
+            # Log room connection details
+            logger.info(f"🎬 Publishing video track to room: {room_name}")
+            logger.info(f"🎵 Publishing audio track to room: {room_name}")
             
             # Create sources
             self.video_source = rtc.VideoSource(854, 480)
@@ -692,6 +697,10 @@ class RapidoMainSystem:
             LIVEKIT_API_KEY = "APIEkRN4enNfAzu"
             LIVEKIT_API_SECRET = "jHEYfEfhaBWQg5isdDgO6e2Xw8zhIvb18KebGwH2ESXC"
             
+            # Get room name from config
+            room_name = getattr(self.config, 'LIVEKIT_ROOM', 'avatar_room')
+            logger.info(f"🏠 Legacy LiveKit connecting to room: {room_name}")
+            
             # Generate JWT token
             current_time = int(time.time())
             token_payload = {
@@ -703,7 +712,7 @@ class RapidoMainSystem:
                 "iat": current_time,
                 "jti": f"avatar_bot_{current_time}",
                 "video": {
-                    "room": "avatar_room",
+                    "room": room_name,  # FIXED: Use actual room name from config
                     "roomJoin": True,
                     "canPublish": True,
                     "canSubscribe": True
@@ -714,6 +723,7 @@ class RapidoMainSystem:
             # Connect to room
             self.lk_room = rtc.Room()
             await self.lk_room.connect(LIVEKIT_URL, token)
+            logger.info(f"✅ Connected to LiveKit room: {room_name}")
             
             # Create sources
             self.video_source = rtc.VideoSource(854, 480)
