@@ -1,0 +1,53 @@
+{
+  "logging": {
+    "log_dir": "./logs",
+    "level": "DEBUG"
+  },
+  "security": {
+    "jwt_algorithm": "HS256",
+    "jwt_expiry_hours": 1,
+    "max_file_size": 52428800,
+    "rate_limit_requests_per_minute": 60
+  },
+  "audio": {
+    "sample_rate": 22050,
+    "channels": 1,
+    "format": "wav"
+  },
+  "video": {
+    "width": 640,
+    "height": 480,
+    "fps": 20.0,
+    "overlay_position": "bottom-right",
+    "overlay_scale": 0.4,
+    "codec": "libx264",
+    "quality": "low"
+  },
+  "tts": {
+    "voice_id": "pNInz6obpgDQGcFmaJgB",
+    "timeout": 15
+  },
+  "synctalk": {
+    "server_url": "http://localhost:8000",
+    "model_name": "enrique_torres",
+    "reconnect_attempts": 2,
+    "timeout": 15
+  },
+  "livekit": {
+    "participant_name": "rapido_dev_bot",
+    "video_bitrate": 800000,
+    "audio_bitrate": 32000
+  },
+  "paths": {
+    "slide_frames": "./presentation_frames",
+    "input_data": "./test1.json",
+    "output": "./output",
+    "temp": "./temp"
+  },
+  "performance": {
+    "max_concurrent_lessons": 1,
+    "frame_buffer_size": 5,
+    "audio_buffer_size": 3,
+    "metrics_collection_interval": 2
+  }
+}

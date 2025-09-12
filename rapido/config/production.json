@@ -1,0 +1,53 @@
+{
+  "logging": {
+    "log_dir": "/var/log/rapido",
+    "level": "INFO"
+  },
+  "security": {
+    "jwt_algorithm": "HS256",
+    "jwt_expiry_hours": 24,
+    "max_file_size": 104857600,
+    "rate_limit_requests_per_minute": 30
+  },
+  "audio": {
+    "sample_rate": 22050,
+    "channels": 1,
+    "format": "mp3"
+  },
+  "video": {
+    "width": 854,
+    "height": 480,
+    "fps": 25.0,
+    "overlay_position": "bottom-right",
+    "overlay_scale": 0.5,
+    "codec": "libx264",
+    "quality": "medium"
+  },
+  "tts": {
+    "voice_id": "pNInz6obpgDQGcFmaJgB",
+    "timeout": 30
+  },
+  "synctalk": {
+    "server_url": "http://35.172.212.10:8000",
+    "model_name": "enrique_torres",
+    "reconnect_attempts": 3,
+    "timeout": 30
+  },
+  "livekit": {
+    "participant_name": "rapido_avatar_bot",
+    "video_bitrate": 1500000,
+    "audio_bitrate": 64000
+  },
+  "paths": {
+    "slide_frames": "/app/data/presentation_frames",
+    "input_data": "/app/data/lessons",
+    "output": "/app/output",
+    "temp": "/tmp/rapido"
+  },
+  "performance": {
+    "max_concurrent_lessons": 3,
+    "frame_buffer_size": 10,
+    "audio_buffer_size": 5,
+    "metrics_collection_interval": 5
+  }
+}

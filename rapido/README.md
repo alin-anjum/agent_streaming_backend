@@ -1,283 +1,421 @@
-# Rapido - Real-time Avatar Presentation Integration with Dynamic Overlay
+# Rapido - Real-time Avatar Presentation System
 
-Rapido is a comprehensive system that creates engaging video presentations by combining slide content with AI-generated avatar narration. It processes slide data, generates speech using ElevenLabs TTS, streams audio to a SyncTalk server for avatar generation, and composites the results into a final video.
+## Refactored Production System v2.0
 
-## Features
+Rapido is a comprehensive real-time avatar presentation system that creates dynamic, interactive video presentations by combining slide content with AI-generated avatars. This refactored version features a modular architecture, comprehensive logging, security features, and production-ready components.
 
-- **Slide Data Processing**: Parses JSON slide data with timing information
-- **TTS Integration**: Streams text-to-speech using ElevenLabs API
-- **Real-time Avatar Generation**: Communicates with SyncTalk server via WebSocket
-- **Frame Composition**: Overlays avatar frames onto slide frames
-- **Timing Synchronization**: Ensures perfect sync between audio, avatar, and slides
-- **Video Generation**: Creates final MP4 output with synchronized audio/video
+## 🚀 Features
 
-## Architecture
+### Core Capabilities
+- **Real-time Avatar Generation**: Integration with SyncTalk for AI-powered talking avatars
+- **Dynamic Video Composition**: Advanced frame composition with chroma key support
+- **Live Streaming**: LiveKit integration for real-time video streaming
+- **Text-to-Speech**: ElevenLabs integration for high-quality narration
+- **Slide Processing**: Automated slide frame processing and timing
+
+### Production Features
+- **Modular Architecture**: Clean separation of concerns with interfaces and services
+- **Comprehensive Logging**: Date-based log rotation with structured JSON logging
+- **Security**: JWT authentication, input validation, rate limiting
+- **Monitoring**: Real-time FPS metrics, performance tracking, error monitoring
+- **Testing**: Full unit and integration test suites
+- **Error Handling**: Robust error handling with detailed logging
+
+### Logging Capabilities
+The system provides detailed logging of:
+1. **Lesson ID** for each processing session
+2. **Starting timestamps** and processing events
+3. **FPS metrics** from slide frames, SyncTalk, composer, and LiveKit
+4. **Audio chunks** streamed to SyncTalk with timing information
+5. **Event tracking** from both backend and frontend components
+6. **Performance data** with timing and resource usage
+7. **Error details** with context and stack traces
+
+## 🏗️ Architecture
+
+### Modular Components
 
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Slide Data    │───▶│   Data Parser    │───▶│  Timing Sync    │
-│   (JSON)        │    │                  │    │                 │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-                                                         │
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   ElevenLabs    │───▶│   TTS Client     │───▶│  Audio Stream   │
-│   TTS API       │    │                  │    │                 │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-                                                         │
-                                                         ▼
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   SyncTalk      │◀───│   WebSocket      │◀───│  Audio Chunks   │
-│   Server        │    │   Client         │    │                 │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-         │                                               │
-         ▼                                               ▼
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│  Avatar Frames  │───▶│  Frame Overlay   │───▶│  Final Video    │
-│                 │    │  Engine          │    │  Generator      │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-                                │
-                                ▼
-                       ┌─────────────────┐
-                       │  Slide Frames   │
-                       │  (PNG files)    │
-                       └─────────────────┘
+src/
+├── core/                    # Core interfaces and shared components
+│   ├── interfaces.py        # Service interfaces and data models
+│   ├── exceptions.py        # Custom exception classes
+│   ├── logging_manager.py   # Advanced logging with date rotation
+│   ├── metrics.py          # Performance metrics and FPS counters
+│   └── security.py         # Authentication and security utilities
+│
+├── services/               # Business logic services
+│   ├── audio_service.py    # Audio processing and TTS
+│   ├── video_service.py    # Video processing and composition
+│   ├── synctalk_service.py # SyncTalk integration
+│   ├── livekit_service.py  # LiveKit streaming
+│   ├── data_service.py     # Data parsing and frame management
+│   └── orchestrator_service.py # Main coordination service
+│
+├── rapido_refactored_main.py  # Main application entry point
+└── rapido_api_refactored.py   # FastAPI web service
 ```
 
-## Installation
+### Key Interfaces
 
-1. **Clone or create the Rapido directory structure**
+- **IAudioProcessor**: Audio processing and optimization
+- **IVideoProcessor**: Video frame processing
+- **ISyncTalkClient**: SyncTalk communication
+- **ILiveKitPublisher**: LiveKit streaming
+- **IDataParser**: Slide data parsing
+- **ITTSClient**: Text-to-speech synthesis
 
-2. **Install Python dependencies**:
-   ```bash
-   cd rapido
-   pip install -r requirements.txt
-   ```
+## 📋 Requirements
 
-3. **Install FFmpeg** (required for video generation):
-   - Windows: Download from https://ffmpeg.org/download.html
-   - macOS: `brew install ffmpeg`
-   - Linux: `sudo apt install ffmpeg`
-
-4. **Configure environment variables**:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your API keys and settings
-   ```
-
-## Configuration
-
-### Required Environment Variables
-
-- `ELEVEN_API_KEY`: Your ElevenLabs API key
-- `SYNCTALK_SERVER_URL`: WebSocket URL for SyncTalk server (e.g., `ws://localhost:8000`)
-
-### Optional Configuration
-
-- `ELEVENLABS_VOICE_ID`: Voice ID for TTS (default: Adam voice)
-- `FRAME_RATE`: Output video frame rate (default: 30)
-- `AVATAR_OVERLAY_POSITION`: Avatar position on slide (default: "bottom-right")
-- `AVATAR_SCALE`: Avatar scale factor (default: 0.3)
-- `VIDEO_CODEC`: Video codec for output (default: "libx264")
-
-## Usage
-
-### Basic Usage
-
+### Dependencies
 ```bash
-# Using the simple runner
-python run_rapido.py
+# Core requirements
+fastapi>=0.116.1
+uvicorn>=0.35.0
+numpy>=1.26.0
+opencv-python>=4.11.0
+pillow>=11.3.0
+asyncio
 
-# Or using the main script directly
-python src/rapido_main.py
+# Audio/Video processing
+librosa>=0.11.0
+soundfile>=0.13.1
+ffmpeg-python>=0.2.0
+
+# AI Services
+elevenlabs>=2.13.0
+transformers>=4.36.0
+
+# Communication
+livekit>=1.0.12
+websockets>=15.0.1
+aiohttp>=3.12.15
+
+# Security
+pyjwt>=2.10.1
+cryptography>=45.0.7
+bcrypt>=4.3.0
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
 ```
 
-### Advanced Usage
-
+### Environment Variables
 ```bash
-python src/rapido_main.py \
-  --input ../test1.json \
-  --frames ../frames \
-  --output ./output \
-  --synctalk-url ws://localhost:8000 \
-  --api-key your_elevenlabs_key \
-  --frame-rate 30 \
-  --verbose
+# Required
+JWT_SECRET=your_jwt_secret_key
+ELEVENLABS_API_KEY=your_elevenlabs_api_key
+LIVEKIT_URL=your_livekit_server_url
+LIVEKIT_API_KEY=your_livekit_api_key
+LIVEKIT_API_SECRET=your_livekit_api_secret
+
+# Optional
+SYNCTALK_SERVER_URL=http://35.172.212.10:8000
+ELEVENLABS_VOICE_ID=pNInz6obpgDQGcFmaJgB
+SLIDE_FRAMES_PATH=./presentation_frames
+RAPIDO_LOG_DIR=./logs
 ```
 
-### Command Line Options
+## 🚀 Quick Start
 
-- `--input, -i`: Input JSON file path
-- `--frames, -f`: Slide frames directory
-- `--output, -o`: Output directory
-- `--synctalk-url`: SyncTalk server URL
-- `--api-key`: ElevenLabs API key
-- `--voice-id`: ElevenLabs voice ID
-- `--frame-rate`: Output frame rate
-- `--verbose, -v`: Enable verbose logging
+### 1. Installation
+```bash
+# Clone the repository
+git clone <repository-url>
+cd rapido
 
-## Input Data Format
+# Install dependencies
+pip install -r requirements.txt
 
-Rapido expects slide data in the following JSON format:
+# Set up environment variables
+cp .env.example .env
+# Edit .env with your configuration
+```
 
+### 2. Configuration
+```bash
+# Copy configuration template
+cp config/development.json config/local.json
+
+# Edit configuration for your environment
+vim config/local.json
+```
+
+### 3. Running the CLI Application
+```bash
+# Process a lesson
+python src/rapido_refactored_main.py --lesson-id "lesson_001" --slide-data "./data/lesson_001.json"
+
+# Check status
+python src/rapido_refactored_main.py --lesson-id "lesson_001" --status-only
+
+# Use custom configuration
+python src/rapido_refactored_main.py --config config/local.json --lesson-id "lesson_001"
+```
+
+### 4. Running the API Server
+```bash
+# Start the API server
+python src/rapido_api_refactored.py --host 0.0.0.0 --port 8080
+
+# With auto-reload for development
+python src/rapido_api_refactored.py --host 0.0.0.0 --port 8080 --reload
+```
+
+## 🔧 API Usage
+
+### Process a Lesson
+```bash
+curl -X POST "http://localhost:8080/process_lesson" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lesson_id": "lesson_001",
+    "slide_data_path": "./data/lesson_001.json",
+    "enable_tts": true,
+    "enable_synctalk": true,
+    "enable_livekit": true
+  }'
+```
+
+### Check System Status
+```bash
+curl "http://localhost:8080/status"
+```
+
+### WebSocket for Real-time Updates
+```javascript
+const ws = new WebSocket('ws://localhost:8080/ws/lesson/lesson_001');
+ws.onmessage = function(event) {
+    const data = JSON.parse(event.data);
+    console.log('Update:', data);
+};
+```
+
+## 📊 Monitoring and Logging
+
+### Log Files
+The system creates date-based log files in the configured log directory:
+- `rapido_YYYY-MM-DD.jsonl`: Main application logs
+- `rapido_performance_YYYY-MM-DD.jsonl`: Performance metrics
+
+### Log Format
+Each log entry contains structured JSON data:
 ```json
 {
-  "slide_data": {
-    "id": "slide-id",
-    "narrationData": {
-      "text": "Your narration text here...",
-      "totalDuration": 45662,
-      "tokens": [
-        {
-          "id": "word-id",
-          "text": "word",
-          "startTime": 1000,
-          "endTime": 1500,
-          "duration": 500,
-          "type": "word"
-        }
-      ]
-    },
-    "objects": [
-      // Slide objects with animation triggers
-    ]
+  "timestamp": "2025-01-10T14:30:25.123456",
+  "level": "INFO",
+  "logger": "rapido.orchestrator",
+  "message": "Processing lesson started",
+  "lesson_id": "lesson_001",
+  "event_type": "lesson_start",
+  "event_source": "backend",
+  "performance_data": {
+    "processing_time": 0.123,
+    "frame_count": 25
   }
 }
 ```
 
-## Slide Frames
+### Metrics Dashboard
+The system tracks comprehensive metrics:
+- **FPS Metrics**: Real-time frame rates for all components
+- **Processing Stats**: Timing and throughput statistics
+- **Error Rates**: Error frequency and types
+- **Resource Usage**: Memory and CPU utilization
 
-Place your slide frames in the frames directory as PNG files:
-- `frame_00000.png`
-- `frame_00001.png`
-- `frame_00002.png`
-- etc.
+## 🧪 Testing
 
-## SyncTalk Server
+### Run Unit Tests
+```bash
+# Run all unit tests
+pytest rapido/tests/unit/ -v
 
-Rapido requires a SyncTalk server running to generate avatar frames. The server should:
+# Run specific test file
+pytest rapido/tests/unit/test_core_components.py -v
 
-1. Accept WebSocket connections
-2. Receive audio chunks via WebSocket
-3. Generate avatar frames based on audio
-4. Stream avatar frames back via WebSocket
-
-### Expected WebSocket Messages
-
-**Outgoing (to SyncTalk):**
-```json
-{
-  "type": "audio_chunk",
-  "data": {
-    "chunk_data": "base64_encoded_audio",
-    "chunk_index": 0,
-    "is_final": false,
-    "timestamp": 1234567890.123
-  }
-}
+# Run with coverage
+pytest rapido/tests/unit/ --cov=src --cov-report=html
 ```
 
-**Incoming (from SyncTalk):**
-```json
-{
-  "type": "avatar_frame",
-  "data": {
-    "frame_data": "base64_encoded_image",
-    "frame_index": 0,
-    "timestamp": 1234567890.123
-  }
-}
+### Run Integration Tests
+```bash
+# Run integration tests
+pytest rapido/tests/integration/ -v
+
+# Run end-to-end tests
+pytest rapido/tests/integration/test_system_integration.py::TestEndToEndWorkflow -v
 ```
 
-## Output
+### Test Configuration
+```bash
+# Set test environment variables
+export RAPIDO_TEST_MODE=true
+export JWT_SECRET=test_secret_key
+```
 
-Rapido generates:
+## 🔒 Security Features
 
-1. **Final Video**: `output/rapido_output.mp4`
-   - Synchronized audio and video
-   - Avatar overlaid on slide frames
-   - Proper timing alignment
+### Authentication
+- JWT-based session management
+- Configurable token expiration
+- Secure token validation
 
-2. **Logs**: `rapido.log`
-   - Detailed processing information
-   - Error messages and debugging info
+### Input Validation
+- Lesson ID format validation
+- File path traversal prevention
+- Audio data format validation
+- JSON structure validation
 
-## Troubleshooting
+### Rate Limiting
+- Per-client request rate limiting
+- Configurable limits per minute
+- Automatic client blocking
+
+### Data Security
+- Input sanitization
+- Secure filename handling
+- Error message sanitization
+
+## 🚀 Deployment
+
+### Docker Deployment
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+EXPOSE 8080
+
+CMD ["python", "src/rapido_api_refactored.py", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+### Production Configuration
+```bash
+# Use production config
+export RAPIDO_CONFIG=config/production.json
+
+# Set production environment variables
+export JWT_SECRET=secure_production_secret
+export RAPIDO_LOG_DIR=/var/log/rapido
+
+# Start with production settings
+python src/rapido_api_refactored.py --host 0.0.0.0 --port 8080
+```
+
+### Systemd Service
+```ini
+[Unit]
+Description=Rapido Avatar Presentation System
+After=network.target
+
+[Service]
+Type=simple
+User=rapido
+WorkingDirectory=/opt/rapido
+Environment=RAPIDO_CONFIG=config/production.json
+ExecStart=/opt/rapido/venv/bin/python src/rapido_api_refactored.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## 📈 Performance Optimization
+
+### Recommended Settings
+- **CPU**: 4+ cores for concurrent processing
+- **Memory**: 8GB+ RAM for video processing
+- **Storage**: SSD for frame caching
+- **Network**: High bandwidth for streaming
+
+### Optimization Tips
+1. **Frame Caching**: Enable frame caching for repeated lessons
+2. **Buffer Sizes**: Tune buffer sizes based on available memory
+3. **Concurrent Processing**: Limit concurrent lessons based on resources
+4. **Log Rotation**: Configure appropriate log rotation intervals
+5. **Metrics Collection**: Adjust metrics collection frequency
+
+## 🐛 Troubleshooting
 
 ### Common Issues
 
-1. **"Failed to connect to SyncTalk server"**
-   - Ensure SyncTalk server is running
-   - Check WebSocket URL in configuration
-   - Verify network connectivity
+#### SyncTalk Connection Failed
+```bash
+# Check SyncTalk server status
+curl http://35.172.212.10:8000/status
 
-2. **"No audio data generated"**
-   - Check ElevenLabs API key
-   - Verify narration text is not empty
-   - Check internet connectivity
+# Verify network connectivity
+ping 35.172.212.10
+```
 
-3. **"Error loading slide frames"**
-   - Ensure frames directory exists
-   - Check PNG file naming convention
-   - Verify file permissions
+#### LiveKit Connection Issues
+```bash
+# Verify LiveKit credentials
+export LIVEKIT_URL=your_url
+export LIVEKIT_API_KEY=your_key
+export LIVEKIT_API_SECRET=your_secret
 
-4. **FFmpeg errors during video generation**
-   - Install FFmpeg system-wide
-   - Check video codec compatibility
-   - Verify output directory permissions
+# Test connection
+python -c "from src.services.livekit_service import LiveKitService; print('LiveKit available')"
+```
+
+#### Permission Issues
+```bash
+# Fix log directory permissions
+sudo mkdir -p /var/log/rapido
+sudo chown rapido:rapido /var/log/rapido
+
+# Fix frame directory permissions
+sudo chown -R rapido:rapido ./presentation_frames
+```
 
 ### Debug Mode
-
-Enable verbose logging for detailed debugging:
-
 ```bash
-python src/rapido_main.py --verbose
+# Enable debug logging
+export LOG_LEVEL=DEBUG
+
+# Run with verbose output
+python src/rapido_refactored_main.py --lesson-id "debug_lesson" -v
 ```
 
-## Development
+## 🤝 Contributing
 
-### Project Structure
+### Development Setup
+```bash
+# Install development dependencies
+pip install -r requirements-dev.txt
 
-```
-rapido/
-├── config/
-│   └── config.py          # Configuration management
-├── src/
-│   ├── data_parser.py     # JSON slide data parser
-│   ├── tts_client.py      # ElevenLabs TTS client
-│   ├── synctalk_client.py # WebSocket client for SyncTalk
-│   ├── frame_processor.py # Frame overlay engine
-│   ├── timing_sync.py     # Timing synchronization
-│   ├── video_generator.py # Video output generation
-│   └── rapido_main.py     # Main orchestrator
-├── output/                # Generated videos
-├── temp/                  # Temporary files
-├── requirements.txt       # Python dependencies
-├── .env                   # Environment configuration
-└── run_rapido.py         # Simple runner script
+# Install pre-commit hooks
+pre-commit install
+
+# Run code formatting
+black src/
+isort src/
+
+# Run linting
+flake8 src/
 ```
 
-### Key Components
+### Code Standards
+- Follow PEP 8 style guidelines
+- Use type hints for all functions
+- Write comprehensive docstrings
+- Add unit tests for new features
+- Update documentation for changes
 
-1. **SlideDataParser**: Extracts narration text and timing data
-2. **ElevenLabsTTSClient**: Streams TTS audio from ElevenLabs
-3. **SyncTalkWebSocketClient**: Manages WebSocket communication
-4. **FrameOverlayEngine**: Composites avatar onto slide frames
-5. **TimingSynchronizer**: Coordinates timing between components
-6. **VideoGenerator**: Creates final MP4 output
+## 📄 License
 
-## License
+[Specify license here]
 
-This project is for educational and development purposes. Ensure you have proper licenses for:
-- ElevenLabs TTS API usage
-- SyncTalk server usage
-- Any slide content and media assets
+## 📞 Support
 
-## Contributing
-
-When contributing to Rapido:
-
-1. Follow Python PEP 8 style guidelines
-2. Add logging for important operations
-3. Include error handling for external APIs
-4. Update documentation for new features
-5. Test with various slide data formats
+For questions, issues, or feature requests:
+- Create an issue in the repository
+- Check the troubleshooting section
+- Review the API documentation
+- Examine log files for detailed error information
