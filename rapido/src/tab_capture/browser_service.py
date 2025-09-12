@@ -281,13 +281,13 @@ class BrowserAutomationService:
             logger.info("🔍 Looking for play button on the webpage...")
             
             play_button_selectors = [
+                'button[class*="play"]',
                 'button[aria-label*="play" i]',
                 'button[title*="play" i]', 
                 'button:has-text("Play")',
                 'button:has-text("▶")',
                 '.play-button',
                 '[data-testid*="play"]',
-                'button[class*="play"]',
                 'input[type="button"][value*="play" i]'
             ]
             
@@ -358,13 +358,13 @@ class BrowserAutomationService:
             logger.info("🔍 Looking for play button on the webpage...")
             
             play_button_selectors = [
+                'button[class*="play"]',
                 'button[aria-label*="play" i]',
                 'button[title*="play" i]', 
                 'button:has-text("Play")',
                 'button:has-text("▶")',
                 '.play-button',
                 '[data-testid*="play"]',
-                'button[class*="play"]',
                 'input[type="button"][value*="play" i]'
             ]
             
