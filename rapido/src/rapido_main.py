@@ -16,6 +16,8 @@ import sys
 import json
 import logging
 import websockets
+import aiohttp
+from urllib.parse import urlencode
 import cv2
 import numpy as np
 from pathlib import Path
@@ -119,6 +121,8 @@ class RapidoMainSystem:
         # Setup paths and connections - use remote SyncTalk server
         self.synctalk_url = getattr(self.config, 'SYNCTALK_WEBSOCKET_URL', 'ws://35.172.212.10:8000')
         self.websocket = None
+        self.aiohttp_session = None
+        self.audio_send_queue = None
         self.avatar_frames = []
         self.avatar_audio_chunks = []
         # Get the script directory and resolve paths relative to the project root
@@ -204,20 +208,22 @@ class RapidoMainSystem:
             logger.warning("⚠️ Running without optimization modules")
         
         # Initialize buffering strategy configuration  
-        # Account for ALL performance factors: SyncTalk production, pipeline processing, LiveKit delivery
+        # REALITY-BASED: SyncTalk produces ~23.1 FPS, Frame pacer delivers ~17.7 FPS
         self.buffer_config = {
-            'min_buffer_threshold': 100,   # Reduced - we now have better monitoring
+            'min_buffer_threshold': 75,    # Smaller buffer - faster startup
             'min_buffer_level': 5,         # Very low threshold - we'll duplicate frames instead of pausing
             'refill_target': 10,           # Not used - we don't refill during playback
-            'target_fps': 25.0,            # Target output frame rate
+            'target_fps': 23.0,            # REALISTIC: Match SyncTalk's actual output (not 25!)
             'max_timing_drift': 0.08,      # Max timing drift before reset (2 frame intervals)
-            'duplicate_when_empty': True,  # Duplicate last frame instead of pausing - SMOOTH PLAYBOOK!
+            'duplicate_when_empty': True,  # Duplicate last frame instead of pausing - SMOOTH PLAYBACK!
             'max_composition_time_ms': 30, # Max acceptable composition time
-            'max_publish_time_ms': 40      # Max acceptable publish time (target <40ms for 25fps)
+            'max_publish_time_ms': 40,     # Max acceptable publish time
+            'bypass_frame_pacer': False    # Fixed: Configure frame pacer properly instead of bypassing
         }
         
         logger.info(f"📊 Rapido initialized - Duration: {self.total_duration_seconds:.2f}s")
         logger.info(f"📦 Buffer config: threshold={self.buffer_config['min_buffer_threshold']}, level={self.buffer_config['min_buffer_level']}, fps={self.buffer_config['target_fps']}")
+        logger.info(f"🎯 REALITY-BASED optimization: SyncTalk ~23 FPS, Frame pacer properly configured for 23 FPS")
     
     def __del__(self):
         """Cleanup thread pool on destruction"""
@@ -393,22 +399,111 @@ class RapidoMainSystem:
         return cv2.addWeighted(avatar_frame, 0.8, slide_frame, 0.2, 0)
     
     async def connect_to_synctalk(self, avatar_name="enrique_torres", sample_rate=16000):
-        """Connect to LOCAL SyncTalk server with protobuf support"""
-        ws_url = f"{self.synctalk_url}/audio_to_video?avatar_name={avatar_name}&sample_rate={sample_rate}"
-        logger.info(f"🔌 Connecting to LOCAL SyncTalk (ULTRA OPTIMIZED): {ws_url}")
+        """Connect to SyncTalk server using DECOUPLED architecture for maximum performance"""
+        # Build optimized WebSocket URL
+        base_url = self.synctalk_url.replace('ws://', 'http://').replace('wss://', 'https://')
+        ws_url = f"ws://{base_url.split('://', 1)[1]}/audio_to_video"
+        params = {
+            "avatar_name": avatar_name,
+            "sample_rate": str(sample_rate)
+        }
+        full_url = f"{ws_url}?{urlencode(params)}"
+        
+        logger.info(f"🔌 Connecting to SyncTalk (DECOUPLED ARCHITECTURE): {full_url}")
         
         try:
-            self.websocket = await websockets.connect(ws_url)
-            logger.info("✅ Connected to SyncTalk!")
+            # Use aiohttp for better WebSocket performance
+            self.aiohttp_session = aiohttp.ClientSession()
+            self.websocket = await self.aiohttp_session.ws_connect(
+                full_url,
+                max_msg_size=10 * 1024 * 1024,  # 10MB max message size for performance
+                heartbeat=30  # Keep connection alive
+            )
+            
+            # Initialize audio queue for decoupled sending
+            self.audio_send_queue = asyncio.Queue(maxsize=1000)  # Much larger queue
+            
+            # Start separate audio processor for non-blocking sends
+            self.audio_processor_task = asyncio.create_task(self._audio_processor_loop())
+            
+            logger.info("✅ Connected to SyncTalk with DECOUPLED architecture!")
+            logger.info("🚀 Audio processor started - audio sending now non-blocking!")
             return True
         except Exception as e:
             logger.error(f"❌ Connection failed: {e}")
+            if self.aiohttp_session:
+                await self.aiohttp_session.close()
             return False
     
     async def send_audio_chunk(self, audio_data: bytes):
-        """Send audio to SyncTalk"""
-        if self.websocket:
-            await self.websocket.send(audio_data)
+        """Queue audio for non-blocking send to SyncTalk"""
+        if self.audio_send_queue:
+            try:
+                # Queue audio for sending - with better error handling
+                await self.audio_send_queue.put({
+                    "type": "audio", 
+                    "data": audio_data
+                })
+            except Exception as e:
+                logger.error(f"Failed to queue audio: {e}")
+                # Fallback to direct send if queue fails
+                if self.websocket:
+                    try:
+                        await self.websocket.send_bytes(audio_data)
+                    except Exception as send_error:
+                        logger.error(f"Direct audio send also failed: {send_error}")
+    
+    async def _audio_processor_loop(self):
+        """Separate audio processor loop - sends audio as fast as possible without blocking"""
+        audio_chunks_sent = 0
+        last_log_time = time.time()
+        
+        logger.info("🎵 Audio processor loop started - decoupled from frame processing")
+        
+        while True:
+            try:
+                # Get audio data from queue with timeout
+                try:
+                    audio_item = await asyncio.wait_for(self.audio_send_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # Check if we should continue
+                    if hasattr(self, 'frame_delivery_running') and not self.frame_delivery_running:
+                        break
+                    continue
+                
+                if audio_item["type"] == "audio":
+                    # Send audio immediately to SyncTalk using aiohttp WebSocket
+                    await self.websocket.send_bytes(audio_item["data"])
+                    audio_chunks_sent += 1
+                    
+                    # Debug log for first few sends
+                    if audio_chunks_sent <= 3:
+                        logger.info(f"🎵 Audio chunk {audio_chunks_sent} sent to SyncTalk ({len(audio_item['data'])} bytes)")
+                    
+                    # Log audio sending rate periodically
+                    current_time = time.time()
+                    if current_time - last_log_time > 3.0:
+                        elapsed = current_time - last_log_time
+                        audio_rate = audio_chunks_sent / elapsed
+                        queue_size = self.audio_send_queue.qsize()
+                        logger.info(f"🎵 AUDIO PROCESSOR: {audio_rate:.1f} chunks/sec sent | Queue: {queue_size}")
+                        audio_chunks_sent = 0
+                        last_log_time = current_time
+                        
+                elif audio_item["type"] == "end_stream":
+                    # Send end of stream marker
+                    await self.websocket.send_bytes(b"end_of_stream")
+                    logger.info("📡 End of stream marker sent via audio processor")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"CRITICAL: Audio processor loop error: {e}")
+                logger.error(f"Audio item type: {audio_item.get('type', 'unknown') if 'audio_item' in locals() else 'no item'}")
+                logger.error(f"WebSocket state: {self.websocket.closed if self.websocket else 'no websocket'}")
+                await asyncio.sleep(0.1)
+                continue
+                
+        logger.info("🎵 Audio processor loop stopped")
     async def connect_livekit(self):
         """Connect to LiveKit with optimized settings"""
         # Check if optimizations are available
@@ -476,10 +571,12 @@ class RapidoMainSystem:
             logger.info("✅ Connected to LiveKit (legacy method)")
             
             # Now initialize optimization components on top of the basic connection
-            # DISABLE frame pacer - it's creating a bottleneck at 18fps
-            # Our timing system is already perfect at 25fps
-            self.frame_pacer = None
-            logger.info("🚀 Frame pacer DISABLED - using direct timing for 25fps")
+            # Initialize frame pacer for consistent delivery - CONFIGURED FOR 23 FPS REALITY
+            self.frame_pacer = AdaptiveFramePacer(
+                target_fps=23.0,        # FIXED: Match SyncTalk's actual output, not wishful 25 FPS
+                min_buffer_size=5,      # Smaller buffer for lower latency
+                max_buffer_size=25      # Optimized for 23 FPS (1 second buffer)
+            )
             
             # Initialize audio optimizer with HIGH_QUALITY mode for stability
             self.audio_optimizer = AudioOptimizer(
@@ -516,9 +613,8 @@ class RapidoMainSystem:
                     except Exception as e:
                         logger.error(f"Error delivering frame: {e}")
             
-            # Skip frame pacer startup - using direct delivery
-            self.frame_pacer_task = None
-            logger.info("🚀 Skipping frame pacer startup - using direct delivery")
+            # Start frame pacer with the wrapper
+            self.frame_pacer_task = asyncio.create_task(self.frame_pacer.start(deliver_frame_wrapper))
             
             # Start audio processing loop (modified for direct audio source)
             async def audio_loop_wrapper():
@@ -573,8 +669,8 @@ class RapidoMainSystem:
             # Give tasks a moment to start
             await asyncio.sleep(0.1)
             
-            logger.info("✅ Connected to LiveKit with DIRECT publishing (no frame pacer bottleneck)!")
-            logger.info(f"Frame pacer: DISABLED (bottleneck removed)")
+            logger.info("✅ Connected to LiveKit with optimizations enabled!")
+            logger.info(f"Frame pacer running: {self.frame_pacer.is_running}")
             logger.info(f"Audio optimizer initialized: {self.audio_optimizer is not None}")
             
             return True
@@ -649,9 +745,9 @@ class RapidoMainSystem:
         logger.info("🚀 Starting OPTIMIZED REAL-TIME ElevenLabs TTS streaming")
         tts_client = ElevenLabsTTSClient(api_key=api_key)
         
-        # Single queue buffering system for smooth 25fps output
-        # Fast collection from SyncTalk, single timing control for output
-        self.intake_queue = asyncio.Queue(maxsize=300)  # Large buffer for fast SyncTalk collection
+        # Single queue buffering system optimized for 23fps reality
+        # Fast collection from SyncTalk, realistic timing control for output
+        self.intake_queue = asyncio.Queue(maxsize=200)  # Optimized buffer size for 23fps
         self.buffer_lock = asyncio.Lock()
         self.last_frame_data = None  # Keep last frame for duplication when buffer empty
         
@@ -686,75 +782,20 @@ class RapidoMainSystem:
                 # Raw PCM from ElevenLabs - no conversion needed!
                 pcm_chunk = chunk_bytes  # Already 16kHz PCM int16 bytes
                 
-                # Send to SyncTalk immediately and track
+                # DECOUPLED: Queue audio immediately (non-blocking!)
                 await self.send_audio_chunk(pcm_chunk)
                 self.audio_chunks_sent += 1
-                
-                # Each 160ms chunk should produce ~4 frames at 25 FPS
-                # Try to collect multiple frames per chunk
-                frames_collected_this_chunk = 0
-                max_frames_to_collect = 4  # We expect up to 4 frames per 160ms chunk
-                
-                for _ in range(max_frames_to_collect):
-                    # Collect avatar frame with timeout
-                    frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.5)
-                    if frame and audio:
-                        # Track received frames for end marker timing
-                        self.frames_received += 1
-                        frames_collected_this_chunk += 1
-                        
-                        # MONITOR SYNCTALK PRODUCTION RATE
-                        self.synctalk_frame_count += 1
-                        if self.synctalk_start_time is None:
-                            self.synctalk_start_time = time.time()
-                        
-                        # Log SyncTalk production rate every 25 frames
-                        if self.synctalk_frame_count % 25 == 0:
-                            elapsed = time.time() - self.synctalk_start_time
-                            synctalk_fps = self.synctalk_frame_count / elapsed
-                            fps_status = "✅" if synctalk_fps >= 24.0 else "⚠️"
-                            logger.info(f"🤖 SYNCTALK PRODUCTION: {fps_status} {synctalk_fps:.1f} FPS (target: ~25 FPS)")
-                            
-                            # Warn about low production rate that will cause buffer issues
-                            if synctalk_fps < 22.0 and self.synctalk_frame_count > 50:
-                                deficit = 25.0 - synctalk_fps
-                                logger.warning(f"🤖 ⚠️ SyncTalk producing {deficit:.1f} FPS below target - expect buffer refills every {60/deficit:.0f}s")
-                        
-                        # Add to queue for smooth continuous delivery
-                        # Use non-blocking put with overflow protection
-                        frame_data = {
-                            "type": "video",
-                            "frame": frame,
-                            "audio": audio,
-                            "timestamp": time.time()
-                        }
-                        
-                        try:
-                            # Add to fast intake queue (as fast as SyncTalk produces)
-                            self.intake_queue.put_nowait(frame_data)
-                        except asyncio.QueueFull:
-                            # Intake full, drop oldest frame
-                            try:
-                                self.intake_queue.get_nowait()  # Remove oldest
-                                self.intake_queue.put_nowait(frame_data)  # Add new
-                                logger.debug("🔄 Intake overflow - dropped oldest frame")
-                            except asyncio.QueueEmpty:
-                                pass
-                        
-                        # Still collect for fallback
-                        self.avatar_frames.append(frame)
-                        self.avatar_audio_chunks.append(audio)
-                    else:
-                        # No more frames available for this chunk, break early
-                        break
                     
             except Exception as e:
                 logger.error(f"Error processing audio chunk: {e}")
         
-        # Start simplified buffer system
-        logger.info("🎬 Starting intake collection and controlled output...")
-        # Only ONE timing control: delivery task pulls from intake at exactly 25fps
-        # NO transfer task to avoid timing conflicts
+        # Start DECOUPLED frame collection system
+        logger.info("🎬 Starting DECOUPLED frame collection and controlled output...")
+        
+        # Start independent frame collector (no blocking audio!)
+        self.frame_collector_task = asyncio.create_task(self._frame_collector_loop())
+        
+        # Start controlled output delivery
         self.frame_delivery_task = asyncio.create_task(
             self.continuous_frame_delivery(frame_processor)
         )
@@ -854,13 +895,13 @@ class RapidoMainSystem:
         
         logger.info(f"📦 Collected {additional_frames_count} additional frames after TTS complete (total: {self.frames_received})")
         
-        # NOW send end marker after we're really done
+        # NOW send end marker after we're really done (via audio processor queue)
         logger.info("📡 Sending end marker to SyncTalk after collecting all frames...")
         try:
-            await self.websocket.send(b"end_of_stream")
-            logger.info("✅ End marker sent")
+            await self.audio_send_queue.put({"type": "end_stream"})
+            logger.info("✅ End marker queued for audio processor")
         except Exception as e:
-            logger.warning(f"Failed to send end marker: {e}")
+            logger.warning(f"Failed to queue end marker: {e}")
         
         # Now stop frame delivery gracefully
         logger.info("🛑 Stopping frame delivery system...")
@@ -873,13 +914,26 @@ class RapidoMainSystem:
             except:
                 break
         
-        # Cancel delivery task
+        # Cancel all tasks
+        tasks_to_cancel = []
+        if hasattr(self, 'frame_collector_task') and self.frame_collector_task:
+            tasks_to_cancel.append(('Frame collector', self.frame_collector_task))
+        if hasattr(self, 'audio_processor_task') and self.audio_processor_task:
+            tasks_to_cancel.append(('Audio processor', self.audio_processor_task))
         if self.frame_delivery_task:
-            self.frame_delivery_task.cancel()
+            tasks_to_cancel.append(('Frame delivery', self.frame_delivery_task))
+        
+        for task_name, task in tasks_to_cancel:
+            task.cancel()
             try:
-                await self.frame_delivery_task
+                await task
             except asyncio.CancelledError:
-                logger.info("✅ Frame delivery task cancelled successfully")
+                logger.info(f"✅ {task_name} task cancelled successfully")
+        
+        # Close aiohttp session
+        if self.aiohttp_session:
+            await self.aiohttp_session.close()
+            logger.info("✅ aiohttp session closed")
         
         return True
     
@@ -895,10 +949,11 @@ class RapidoMainSystem:
             refill_target = self.buffer_config['refill_target']
             target_fps = self.buffer_config['target_fps']
             max_timing_drift = self.buffer_config['max_timing_drift']
-            frame_interval = 1.0 / target_fps  # 0.04 seconds = 40ms per frame
+            frame_interval = 1.0 / target_fps  # ~0.043 seconds = 43.5ms per frame at 23fps
             
             logger.info(f"🎬 Output delivery started - waiting for {min_buffer_threshold} frame intake buffer")
             logger.info(f"⏱️ Performance targets: Composition <{self.buffer_config['max_composition_time_ms']}ms | Publish <{self.buffer_config['max_publish_time_ms']}ms")
+            logger.info(f"🎯 REALITY-BASED: Target {target_fps} FPS to match SyncTalk actual performance")
             self.frame_delivery_start_time = time.time()
             
             # Phase 1: Wait for buffer to fill above threshold
@@ -911,7 +966,7 @@ class RapidoMainSystem:
                 if intake_size >= min_buffer_threshold:
                     buffer_filled = True
                     buffer_wait_time = time.time() - buffer_wait_start
-                    logger.info(f"🎬 ✅ Intake buffer filled! {intake_size} frames ready after {buffer_wait_time:.1f}s - starting steady 25fps output")
+                    logger.info(f"🎬 ✅ Intake buffer filled! {intake_size} frames ready after {buffer_wait_time:.1f}s - starting steady {target_fps}fps output")
                     break
                 
                 # Log buffer filling progress every 2 seconds
@@ -1069,7 +1124,12 @@ class RapidoMainSystem:
                                 
                                 logger.info(f"🎬 {status_icon} PRECISE OUTPUT: {actual_output_fps:.2f}/{target_fps} FPS ({timing_accuracy:.1f}% accuracy)")
                                 logger.info(f"📊 OUTPUT BREAKDOWN: Total: {total_output_fps:.1f} FPS | Real: {real_fps:.1f} | Duplicated: {duplicate_fps:.1f} ({duplicate_ratio:.1f}%)")
-                                logger.info(f"⏱️ PIPELINE TIMING: Avg: {avg_publish_time:.1f}ms | Max: {max_publish_time:.1f}ms | Slow: {slow_ratio:.1f}% (target: <40ms)")
+                                logger.info(f"⏱️ PIPELINE TIMING: Avg: {avg_publish_time:.1f}ms | Max: {max_publish_time:.1f}ms | Slow: {slow_ratio:.1f}% (target: <{self.buffer_config['max_publish_time_ms']}ms)")
+                                
+                                # Log frame pacer configuration status
+                                if hasattr(self, 'frame_pacer') and self.frame_pacer:
+                                    pacer_fps = self.frame_pacer.target_fps
+                                    logger.info(f"🔄 FRAME PACER: Configured for {pacer_fps} FPS (matching SyncTalk reality)")
                                 
                                 frames_output = 0
                                 last_timing_log = current_time
@@ -1113,6 +1173,75 @@ class RapidoMainSystem:
         
         logger.info("🎬 Buffered frame delivery stopped")
     
+    async def _frame_collector_loop(self):
+        """Independent frame collector - runs continuously without blocking audio"""
+        logger.info("🎬 Frame collector started - collecting frames independently from audio")
+        
+        frame_collection_count = 0
+        collection_start_time = time.time()
+        
+        while self.frame_delivery_running:
+            try:
+                # Collect frames as fast as SyncTalk produces them
+                frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.1)
+                
+                if frame and audio:
+                    # Track received frames for monitoring
+                    self.frames_received += 1
+                    frame_collection_count += 1
+                    
+                    # MONITOR SYNCTALK PRODUCTION RATE
+                    self.synctalk_frame_count += 1
+                    if self.synctalk_start_time is None:
+                        self.synctalk_start_time = time.time()
+                    
+                    # Log SyncTalk production rate every 25 frames
+                    if self.synctalk_frame_count % 25 == 0:
+                        elapsed = time.time() - self.synctalk_start_time
+                        synctalk_fps = self.synctalk_frame_count / elapsed
+                        fps_status = "✅" if synctalk_fps >= 24.0 else "⚠️"
+                        logger.info(f"🤖 SYNCTALK DECOUPLED: {fps_status} {synctalk_fps:.1f} FPS (no backpressure!)")
+                        
+                        # Calculate decoupling benefit
+                        current_time = time.time()
+                        collection_elapsed = current_time - collection_start_time
+                        collection_rate = frame_collection_count / collection_elapsed if collection_elapsed > 0 else 0
+                        if collection_rate > synctalk_fps * 1.1:
+                            logger.info(f"🚀 DECOUPLING BENEFIT: Collecting at {collection_rate:.1f} FPS vs SyncTalk {synctalk_fps:.1f} FPS")
+                    
+                    # Add to queue for smooth continuous delivery
+                    frame_data = {
+                        "type": "video",
+                        "frame": frame,
+                        "audio": audio,
+                        "timestamp": time.time()
+                    }
+                    
+                    try:
+                        # Add to fast intake queue
+                        self.intake_queue.put_nowait(frame_data)
+                    except asyncio.QueueFull:
+                        # Intake full, drop oldest frame
+                        try:
+                            self.intake_queue.get_nowait()  # Remove oldest
+                            self.intake_queue.put_nowait(frame_data)  # Add new
+                            logger.debug("🔄 Intake overflow - dropped oldest frame")
+                        except asyncio.QueueEmpty:
+                            pass
+                    
+                    # Still collect for fallback
+                    self.avatar_frames.append(frame)
+                    self.avatar_audio_chunks.append(audio)
+                    
+            except asyncio.TimeoutError:
+                # No frames available right now - continue collecting
+                continue
+            except Exception as e:
+                logger.error(f"Error in frame collector: {e}")
+                await asyncio.sleep(0.1)
+                continue
+        
+        logger.info("🎬 Frame collector stopped")
     
     def configure_buffer_strategy(self, **kwargs):
         """
@@ -1148,14 +1277,31 @@ class RapidoMainSystem:
         logger.info(f"📦 Current buffer config: {self.buffer_config}")
     
     async def publish_frame_to_livekit(self, bgr_frame, audio_chunk):
-        """Publish frame and audio to LiveKit - DIRECT MODE (no frame pacer bottleneck)"""
-        # BYPASS the frame pacer bottleneck - use direct publishing for true 25fps
-        if not hasattr(self, '_logged_direct_mode'):
-            self._logged_direct_mode = True
-            logger.info("🚀 Using DIRECT LiveKit publishing - bypassing frame pacer bottleneck!")
+        """Publish frame and audio to LiveKit with properly configured optimizations"""
+        # Check if optimizations are available and properly configured
+        use_optimized = (OPTIMIZATIONS_AVAILABLE and 
+                        hasattr(self, 'frame_pacer') and self.frame_pacer and
+                        hasattr(self, 'audio_optimizer') and self.audio_optimizer)
         
-        # Use direct legacy publishing for maximum performance
-        return await self._publish_frame_to_livekit_legacy(bgr_frame, audio_chunk)
+        if use_optimized:
+            # Convert BGR to RGB for optimized path with FIXED frame pacer
+            rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+            return await self.publish_frame_to_livekit_optimized(rgb_frame, audio_chunk)
+        else:
+            # Log once why we're using legacy mode
+            if not hasattr(self, '_logged_legacy_mode'):
+                self._logged_legacy_mode = True
+                reasons = []
+                if not OPTIMIZATIONS_AVAILABLE:
+                    reasons.append("optimizations not available")
+                if not hasattr(self, 'frame_pacer') or not self.frame_pacer:
+                    reasons.append("frame_pacer not initialized")
+                if not hasattr(self, 'audio_optimizer') or not self.audio_optimizer:
+                    reasons.append("audio_optimizer not initialized")
+                logger.info(f"Using legacy LiveKit publishing ({', '.join(reasons)})")
+            
+            # Use legacy publishing
+            return await self._publish_frame_to_livekit_legacy(bgr_frame, audio_chunk)
     
     async def publish_frame_to_livekit_optimized(self, composed_frame, audio_chunk):
         """Optimized frame and audio publishing with buffering"""
@@ -1208,19 +1354,13 @@ class RapidoMainSystem:
             logger.error(f"Error in optimized publishing: {e}")
     
     async def _publish_frame_to_livekit_legacy(self, bgr_frame, audio_chunk):
-        """Legacy frame and audio publishing with proper error handling"""
+        """Legacy frame and audio publishing"""
         try:
             import livekit.rtc as rtc
             
             if not hasattr(self, 'video_source') or not hasattr(self, 'audio_source'):
-                logger.warning("LiveKit video or audio source not available")
                 return
             
-            # Check if video source is still valid
-            if not self.video_source:
-                logger.warning("Video source is None")
-                return
-                
             # Convert BGR to RGB for video frame
             rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
             
@@ -1232,40 +1372,22 @@ class RapidoMainSystem:
                 data=rgb_frame.tobytes()
             )
             
-            # Publish video frame with error handling
-            try:
-                self.video_source.capture_frame(video_frame)
-            except Exception as video_error:
-                if "InvalidState" in str(video_error):
-                    # Log once and continue - LiveKit connection might be initializing
-                    if not hasattr(self, '_video_invalid_logged'):
-                        self._video_invalid_logged = True
-                        logger.warning(f"LiveKit video source not ready yet: {video_error}")
-                    return
-                else:
-                    raise video_error
+            # Publish video frame
+            self.video_source.capture_frame(video_frame)
             
             # Create audio frame from PCM chunk
-            if len(audio_chunk) > 0 and self.audio_source:
-                try:
-                    audio_data = np.frombuffer(audio_chunk, dtype=np.int16)
-                    samples_per_channel = len(audio_data)
-                    
-                    audio_frame = rtc.AudioFrame(
-                        sample_rate=16000,
-                        num_channels=1,
-                        samples_per_channel=samples_per_channel,
-                        data=audio_data.tobytes()
-                    )
-                    
-                    await self.audio_source.capture_frame(audio_frame)
-                except Exception as audio_error:
-                    if "InvalidState" in str(audio_error):
-                        if not hasattr(self, '_audio_invalid_logged'):
-                            self._audio_invalid_logged = True
-                            logger.warning(f"LiveKit audio source not ready yet: {audio_error}")
-                    else:
-                        logger.error(f"Audio publishing error: {audio_error}")
+            if len(audio_chunk) > 0:
+                audio_data = np.frombuffer(audio_chunk, dtype=np.int16)
+                samples_per_channel = len(audio_data)
+                
+                audio_frame = rtc.AudioFrame(
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=samples_per_channel,
+                    data=audio_data.tobytes()
+                )
+                
+                await self.audio_source.capture_frame(audio_frame)
                 
         except Exception as e:
             logger.error(f"Error in legacy publishing: {e}")
@@ -1273,8 +1395,16 @@ class RapidoMainSystem:
     def _log_optimization_metrics(self):
         """Log comprehensive optimization metrics"""
         try:
-            # Frame pacer disabled for direct 25fps delivery
-            logger.info("📊 Frame Pacer: DISABLED - using direct 25fps delivery")
+            if self.frame_pacer:
+                metrics = self.frame_pacer.get_metrics()
+                logger.info(
+                    f"📊 Frame Pacer: {metrics.actual_fps:.1f}/{metrics.target_fps:.0f} FPS | "
+                    f"Delivered: {metrics.frames_delivered} | "
+                    f"Dropped: {metrics.frames_dropped} | "
+                    f"Duplicated: {metrics.frames_duplicated} | "
+                    f"Latency: {metrics.average_latency_ms:.1f}ms | "
+                    f"Buffer: {metrics.buffer_utilization:.0%}"
+                )
             
             if self.audio_optimizer:
                 audio_stats = self.audio_optimizer.get_stats()
@@ -1291,8 +1421,8 @@ class RapidoMainSystem:
             # LiveKit stats logging (simplified without publisher)
             if hasattr(self, 'lk_room') and self.lk_room:
                 logger.info(
-                    f"📡 LiveKit: Connected and publishing DIRECT | "
-                    f"Frame pacer: DISABLED | "
+                    f"📡 LiveKit: Connected and publishing | "
+                    f"Frame pacer: {self.frame_pacer.is_running if self.frame_pacer else 'N/A'} | "
                     f"Audio optimizer: {'Active' if self.audio_optimizer else 'N/A'}"
                 )
                 
@@ -1309,9 +1439,15 @@ class RapidoMainSystem:
             logger.error(f"Error logging metrics: {e}")
     
     async def receive_avatar_frame_with_audio(self, timeout=1.5):
-        """Receive protobuf frame and audio from SyncTalk"""
+        """Receive protobuf frame and audio from SyncTalk using aiohttp WebSocket"""
         try:
-            protobuf_data = await asyncio.wait_for(self.websocket.recv(), timeout=timeout)
+            # Use aiohttp WebSocket receive
+            msg = await asyncio.wait_for(self.websocket.receive(), timeout=timeout)
+            
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                protobuf_data = msg.data
+            else:
+                return None, None
             
             if isinstance(protobuf_data, bytes):
                 frame_msg = FrameMessage()
@@ -1816,8 +1952,15 @@ class RapidoMainSystem:
             logger.error(f"❌ Processing failed: {e}")
             raise
         finally:
+            # Cleanup connections properly
+            if hasattr(self, 'audio_processor_task') and self.audio_processor_task:
+                self.audio_processor_task.cancel()
+            if hasattr(self, 'frame_collector_task') and self.frame_collector_task:
+                self.frame_collector_task.cancel()
             if self.websocket:
                 await self.websocket.close()
+            if self.aiohttp_session:
+                await self.aiohttp_session.close()
 
 def check_synctalk_server():
     """Verify SyncTalk server is running"""
