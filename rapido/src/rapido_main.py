@@ -536,12 +536,12 @@ class RapidoMainSystem:
             current_time = int(time.time())
             token_payload = {
                 "iss": LIVEKIT_API_KEY,
-                "sub": "avatar_bot",
+                "sub": f"avatar_bot_{room_name}",  # FIXED: Unique identity per room
                 "aud": "livekit",
                 "exp": current_time + 3600,
                 "nbf": current_time - 10,
                 "iat": current_time,
-                "jti": f"avatar_bot_{current_time}",
+                "jti": f"avatar_bot_{room_name}_{current_time}",  # FIXED: Include room name in JWT ID
                 "video": {
                     "room": room_name,  # FIXED: Use actual room name from config
                     "roomJoin": True,
@@ -705,12 +705,12 @@ class RapidoMainSystem:
             current_time = int(time.time())
             token_payload = {
                 "iss": LIVEKIT_API_KEY,
-                "sub": "avatar_bot",
+                "sub": f"avatar_bot_{room_name}",  # FIXED: Unique identity per room
                 "aud": "livekit",
                 "exp": current_time + 3600,
                 "nbf": current_time - 10,
                 "iat": current_time,
-                "jti": f"avatar_bot_{current_time}",
+                "jti": f"avatar_bot_{room_name}_{current_time}",  # FIXED: Include room name in JWT ID
                 "video": {
                     "room": room_name,  # FIXED: Use actual room name from config
                     "roomJoin": True,
@@ -1193,12 +1193,16 @@ class RapidoMainSystem:
         while self.frame_delivery_running:
             try:
                 # Collect frames as fast as SyncTalk produces them
-                frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.1)
+                frame, audio = await self.receive_avatar_frame_with_audio(timeout=1.0)  # Increased timeout
                 
                 if frame and audio:
                     # Track received frames for monitoring
                     self.frames_received += 1
                     frame_collection_count += 1
+                    
+                    # Log first frame received
+                    if frame_collection_count == 1:
+                        logger.info(f"🎉 First frame received from SyncTalk! Frame collection working.")
                     
                     # MONITOR SYNCTALK PRODUCTION RATE
                     self.synctalk_frame_count += 1
@@ -1244,7 +1248,9 @@ class RapidoMainSystem:
                     self.avatar_audio_chunks.append(audio)
                     
             except asyncio.TimeoutError:
-                # No frames available right now - continue collecting
+                # No frames available right now - log and continue collecting
+                if frame_collection_count == 0:  # Only log if we haven't received any frames yet
+                    logger.warning(f"🔍 Frame collection timeout - no frames from SyncTalk yet")
                 continue
             except Exception as e:
                 logger.error(f"Error in frame collector: {e}")

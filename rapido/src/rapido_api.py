@@ -90,12 +90,16 @@ async def log_requests(request: Request, call_next):
 # Active sessions storage
 active_sessions: Dict[str, Dict[str, Any]] = {}
 
+# Active room tracking - prevents duplicate avatars
+active_rooms: Dict[str, Dict[str, Any]] = {}  # room_name -> {"avatar_active": bool, "session_id": str, "created_at": datetime}
+
 # Request models
 class LiveKitTokenRequest(BaseModel):
     lessonId: str
     videoJobId: str
     documentId: str
     userId: str
+    sessionId: str
     organizationId: str
     authToken: str
 
@@ -187,7 +191,25 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "active_sessions": len(active_sessions)
+        "active_sessions": len(active_sessions),
+        "active_rooms": len(active_rooms)
+    }
+
+@app.get("/api/v1/rooms/status")
+async def get_rooms_status():
+    """Get status of all active rooms"""
+    return {
+        "active_rooms": {
+            room_name: {
+                "lesson_id": room_info["lesson_id"],
+                "video_job_id": room_info["video_job_id"],
+                "avatar_active": room_info["avatar_active"],
+                "created_at": room_info["created_at"].isoformat(),
+                "session_id": room_info["session_id"]
+            }
+            for room_name, room_info in active_rooms.items()
+        },
+        "total_rooms": len(active_rooms)
     }
 
 @app.get("/")
@@ -253,7 +275,7 @@ async def authenticate_with_creatium(auth_payload: AuthenticateDocumentPayload, 
 async def generate_livekit_token_endpoint(request: LiveKitTokenRequest):
     """Generate LiveKit JWT token after authentication validation"""
     try:
-        logger.info(f"🔑 Token request for lesson: {request.lessonId}, user: {request.userId}, jobId: {request.videoJobId}")
+        logger.info(f"🔑 Token request for lesson: {request.lessonId}, user: {request.userId}, session: {request.sessionId}, jobId: {request.videoJobId}")
         
         # Step 1: Authenticate with Creatium API
         # TEMPORARILY BYPASSED FOR TESTING - uncomment for production
@@ -275,14 +297,18 @@ async def generate_livekit_token_endpoint(request: LiveKitTokenRequest):
         
         # Step 2: Generate LiveKit token (lessonId becomes room name)
         room_name = request.lessonId  # Use lessonId as room name
-        participant_name = f"user_{request.userId[:8]}"  # Use shortened userId as participant name
+        participant_name = f"user_{request.userId[:8]}_{request.sessionId[:8]}"  # Use userId + sessionId combination
         livekit_token = generate_livekit_token(room_name, participant_name)
         livekit_url = "wss://agent-s83m6c4y.livekit.cloud"
         
-        logger.info(f"✅ Token generated for {participant_name} in lesson room {room_name}")
+        logger.info(f"✅ Token generated for {participant_name} (user: {request.userId}, session: {request.sessionId}) in lesson room {room_name}")
         
-        # Step 3: Auto-trigger avatar presentation in this room
-        asyncio.create_task(auto_start_presentation(room_name, request.lessonId, request.videoJobId))
+        # Step 3: Smart room management - only start avatar if room doesn't have one
+        if await should_start_avatar_in_room(room_name):
+            logger.info(f"🚀 Starting new avatar in room {room_name}")
+            asyncio.create_task(auto_start_presentation(room_name, request.lessonId, request.videoJobId))
+        else:
+            logger.info(f"👥 Avatar already active in room {room_name} - user joining existing presentation")
         
         return LiveKitTokenResponse(
             room=room_name,
@@ -296,23 +322,84 @@ async def generate_livekit_token_endpoint(request: LiveKitTokenRequest):
         logger.error(f"Failed to generate LiveKit token: {e}")
         raise HTTPException(status_code=500, detail="Token generation failed")
 
+async def should_start_avatar_in_room(room_name: str) -> bool:
+    """Check if we should start an avatar in this room"""
+    global active_rooms
+    
+    # Check if room already has an active avatar
+    if room_name in active_rooms:
+        room_info = active_rooms[room_name]
+        
+        # Check if avatar is still active (session exists and not finished)
+        session_id = room_info.get("session_id")
+        if session_id and session_id in active_sessions:
+            session = active_sessions[session_id]
+            if session.get("status") in ["streaming", "initializing", "connecting_livekit", "connecting_synctalk"]:
+                logger.info(f"🔍 Room {room_name} already has active avatar (session: {session_id})")
+                return False
+            else:
+                logger.info(f"🔍 Room {room_name} avatar session ended - can start new one")
+                # Remove stale room entry
+                del active_rooms[room_name]
+                return True
+        else:
+            logger.info(f"🔍 Room {room_name} session not found - can start new avatar")
+            # Remove stale room entry
+            del active_rooms[room_name]  
+            return True
+    
+    logger.info(f"🔍 Room {room_name} is empty - can start avatar")
+    return True
+
 async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: str):
     """Auto-start avatar presentation when someone gets a token"""
+    session_id = f"avatar_{lesson_id}_{int(time.time())}"
+    
     try:
+        # Register this room as having an active avatar
+        active_rooms[room_name] = {
+            "avatar_active": True,
+            "session_id": session_id,
+            "lesson_id": lesson_id,
+            "video_job_id": video_job_id,
+            "created_at": datetime.now()
+        }
+        
+        # Create session tracking
+        session_info = {
+            "session_id": session_id,
+            "room": room_name,
+            "lesson_id": lesson_id,
+            "video_job_id": video_job_id,
+            "status": "initializing",
+            "created_at": datetime.now()
+        }
+        active_sessions[session_id] = session_info
+        
         logger.info(f"🚀 Auto-starting presentation for lesson: {lesson_id}, jobId: {video_job_id} in room: {room_name}")
         
         # Create Rapido system with room override
         config_override = {'LIVEKIT_ROOM': room_name}
         rapido = RapidoMainSystem(config_override)
+        session_info["rapido_system"] = rapido
+        
+        # Update session status
+        session_info["status"] = "connecting_livekit"
         
         # Connect to LiveKit
         await rapido.connect_livekit()
         logger.info(f"✅ LiveKit connected for lesson room: {room_name}")
         
+        # Update session status
+        session_info["status"] = "connecting_synctalk"
+        
         # Connect to SyncTalk  
         if not await rapido.connect_to_synctalk():
             raise Exception("SyncTalk connection failed")
         logger.info(f"✅ SyncTalk connected for lesson: {lesson_id}")
+        
+        # Update session status
+        session_info["status"] = "streaming"
         
         # Load actual lesson content - use existing test1.json for now
         # TODO: Replace with actual lesson content loading based on lesson_id
@@ -332,12 +419,36 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         success = await rapido.stream_real_time_tts(actual_narration)
         
         if success:
+            session_info["status"] = "completed"
             logger.info(f"✅ Presentation completed for lesson: {lesson_id}")
         else:
+            session_info["status"] = "failed"
             logger.error(f"❌ Presentation failed for lesson: {lesson_id}")
             
     except Exception as e:
         logger.error(f"❌ Auto-start failed for lesson {lesson_id}: {e}")
+        if session_id in active_sessions:
+            active_sessions[session_id]["status"] = "error"
+            active_sessions[session_id]["error"] = str(e)
+            
+    finally:
+        # Clean up room registration when avatar finishes
+        if room_name in active_rooms:
+            logger.info(f"🧹 Cleaning up room registration for {room_name}")
+            del active_rooms[room_name]
+        
+        # Cleanup Rapido connections
+        if session_id in active_sessions:
+            session = active_sessions[session_id]
+            if session.get("rapido_system"):
+                try:
+                    rapido_system = session["rapido_system"]
+                    if hasattr(rapido_system, 'websocket') and rapido_system.websocket:
+                        await rapido_system.websocket.close()
+                    if hasattr(rapido_system, 'aiohttp_session') and rapido_system.aiohttp_session:
+                        await rapido_system.aiohttp_session.close()
+                except Exception as cleanup_error:
+                    logger.error(f"Cleanup error: {cleanup_error}")
 
 async def start_rapido_session(session_id: str, narration_text: str, avatar_name: str, config_override: Dict[str, Any]):
     """Background task to run Rapido presentation"""
