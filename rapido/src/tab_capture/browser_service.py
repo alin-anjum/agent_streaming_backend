@@ -222,21 +222,14 @@ class BrowserAutomationService:
                     HTMLCanvasElement.prototype.toDataURL = function(type, quality) {
                         const dataURL = originalToDataURL.call(this, type, quality);
                         
-                        // Throttle frame capture to 25 FPS
-                        const now = Date.now();
-                        if (now - window.lastCaptureTime < frameInterval) {
-                            return dataURL; // Skip this frame
-                        }
-                        window.lastCaptureTime = now;
-                        
-                        // Store frame in buffer
+                        // Store ALL frames (no throttling for debugging)
                         if (dataURL && dataURL.startsWith('data:image/')) {
                             window.frameBuffer[window.bufferSize] = dataURL;
                             window.bufferSize++;
                             
-                            // Log progress every 25 frames
-                            if (window.bufferSize % 25 === 0) {
-                                console.log(`📸 Slide capture buffer: ${window.bufferSize} frames (25 FPS throttled)`);
+                            // Log progress every 10 frames for better monitoring
+                            if (window.bufferSize % 10 === 0) {
+                                console.log(`📸 Slide capture buffer: ${window.bufferSize} frames (NO throttling)`);
                             }
                         }
                         
@@ -255,8 +248,8 @@ class BrowserAutomationService:
                                     window.frameBuffer[window.bufferSize] = reader.result;
                                     window.bufferSize++;
                                     
-                                    if (window.bufferSize % 25 === 0) {
-                                        console.log(`📸 Slide capture buffer: ${window.bufferSize} frames`);
+                                    if (window.bufferSize % 10 === 0) {
+                                        console.log(`📸 Slide capture buffer: ${window.bufferSize} frames (toBlob)`);
                                     }
                                 };
                                 reader.readAsDataURL(blob);
@@ -267,6 +260,9 @@ class BrowserAutomationService:
                     };
                     
                     console.log('🔧 Slide capture hooks installed successfully');
+                    
+                    // Debug: Log when any canvas method is called
+                    console.log('🎯 Canvas hooks ready - waiting for toDataURL/toBlob calls...');
                 }
             """)
             
@@ -307,16 +303,15 @@ class BrowserAutomationService:
                     logger.info("🔗 Installing capture hooks right before play button click...")
                     await self._setup_slide_capture_hooks()
                     
-                    # Enable CDP screencast at 25 FPS
-                    logger.info("📹 Setting up CDP screencast at 25 FPS...")
+                    # Enable CDP screencast for non-canvas presentations
+                    logger.info("📹 Setting up CDP screencast for non-canvas presentation...")
                     session = await self.page.context.new_cdp_session(self.page)
-                    every_nth = max(1, 50 // self.config.capture_fps)  # 50fps -> 25fps = every 2nd frame
-                    logger.info(f"📹 CDP throttling: capturing every {every_nth} frame(s) for {self.config.capture_fps} FPS")
                     await session.send("Page.startScreencast", {
                         "format": "png",
                         "quality": 90,
-                        "everyNthFrame": every_nth
+                        "everyNthFrame": 1  # Capture every frame, no throttling
                     })
+                    logger.info("✅ CDP screencast enabled - will capture presentation frames")
                     
                     # Click the play button using JavaScript for reliability
                     logger.info("🎯 Clicking play button with JavaScript...")
@@ -347,8 +342,8 @@ class BrowserAutomationService:
             logger.info("⏱️ Waiting for slide's useDomCapture to activate...")
             await asyncio.sleep(0.5)
             
-            # Monitor slide capture to specific directory
-            await self._handle_slide_capture_monitoring_to_dir(duration, target_directory)
+            # Monitor slide capture to specific directory (with CDP support)
+            await self._handle_slide_capture_monitoring_to_dir_with_cdp(duration, target_directory)
             
         except Exception as e:
             logger.error(f"❌ Automated play and slide capture failed: {e}")
@@ -423,7 +418,116 @@ class BrowserAutomationService:
             logger.error(f"❌ Automated play and slide capture failed: {e}")
             return None
 
-    async def _handle_slide_capture_monitoring_to_dir(self, duration: int, target_directory: str):
+    async def _handle_slide_capture_monitoring_to_dir_with_cdp(self, duration: int, target_directory: str):
+        """Monitor slide capture with CDP screencast fallback"""
+        try:
+            logger.info("🎬 Starting slide capture monitoring with CDP support...")
+            frames_dir = Path(target_directory)
+            
+            total_saved = 0
+            start_time = time.time()
+            cdp_session = None
+            
+            # Get CDP session for screencast
+            try:
+                cdp_session = await self.page.context.new_cdp_session(self.page)
+                logger.info("📹 CDP session established for frame capture")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not establish CDP session: {e}")
+            
+            # Monitor for frames
+            while time.time() - start_time < duration:
+                try:
+                    frames_captured_this_cycle = 0
+                    
+                    # First try canvas buffer (if presentation uses canvas)
+                    buffer_status = await self.page.evaluate("""
+                        () => {
+                            return {
+                                bufferSize: window.bufferSize || 0,
+                                isComplete: window.slideCaptureComplete || false
+                            };
+                        }
+                    """)
+                    
+                    buffer_size = buffer_status.get('bufferSize', 0)
+                    
+                    if buffer_size > total_saved:
+                        # Process canvas frames
+                        frames_to_process = min(buffer_size - total_saved, 8)
+                        
+                        for frame_idx in range(total_saved, min(total_saved + frames_to_process, buffer_size)):
+                            try:
+                                frame_data = await self.page.evaluate(f"""
+                                    () => {{
+                                        if (window.frameBuffer && window.frameBuffer[{frame_idx}]) {{
+                                            return window.frameBuffer[{frame_idx}];
+                                        }}
+                                        return null;
+                                    }}
+                                """)
+                                
+                                if frame_data and isinstance(frame_data, str) and frame_data.startswith('data:image/png;base64,'):
+                                    import base64
+                                    image_data = base64.b64decode(frame_data.split(',')[1])
+                                    
+                                    frame_filename = f"frame_{total_saved:06d}.png"
+                                    frame_path = frames_dir / frame_filename
+                                    with open(frame_path, 'wb') as f:
+                                        f.write(image_data)
+                                    
+                                    total_saved += 1
+                                    frames_captured_this_cycle += 1
+                                    
+                            except Exception as e:
+                                logger.debug(f"Canvas frame {frame_idx} processing failed: {e}")
+                                continue
+                    
+                    # If no canvas frames, try CDP screencast
+                    if frames_captured_this_cycle == 0 and cdp_session:
+                        try:
+                            # Request screencast frame
+                            result = await cdp_session.send("Page.captureScreenshot", {
+                                "format": "png",
+                                "quality": 90
+                            })
+                            
+                            if result and 'data' in result:
+                                import base64
+                                image_data = base64.b64decode(result['data'])
+                                
+                                frame_filename = f"frame_{total_saved:06d}.png"
+                                frame_path = frames_dir / frame_filename
+                                with open(frame_path, 'wb') as f:
+                                    f.write(image_data)
+                                
+                                total_saved += 1
+                                frames_captured_this_cycle += 1
+                                
+                        except Exception as e:
+                            logger.debug(f"CDP screenshot failed: {e}")
+                    
+                    # Log progress
+                    if total_saved % 25 == 0 and frames_captured_this_cycle > 0:
+                        elapsed = time.time() - start_time
+                        fps = total_saved / elapsed if elapsed > 0 else 0
+                        logger.info(f"📸 Saved {total_saved} frames in {elapsed:.1f}s ({fps:.1f} FPS)")
+                    
+                    # Sleep for next cycle
+                    await asyncio.sleep(0.04)  # 25 FPS timing
+                    
+                except Exception as e:
+                    logger.debug(f"Error in monitoring loop: {e}")
+                    await asyncio.sleep(0.1)
+                    continue
+            
+            logger.info(f"✅ Slide capture monitoring completed: {total_saved} frames saved to {frames_dir}")
+            
+        except Exception as e:
+            logger.error(f"❌ Slide capture monitoring failed: {e}")
+            raise
+
+    async def _handle_slide_capture_monitoring_to_dir_old(self, duration: int, target_directory: str):
         """Monitor slide capture and save frames to specific directory"""
         try:
             logger.info("🎬 Starting slide capture monitoring...")
@@ -449,8 +553,8 @@ class BrowserAutomationService:
                     is_complete = buffer_status.get('isComplete', False)
                     
                     if buffer_size > total_saved:
-                        # Process new frames
-                        frames_to_process = min(buffer_size - total_saved, 12)
+                        # Process new frames (optimized batch size for performance)
+                        frames_to_process = min(buffer_size - total_saved, 8)
                         
                         for frame_idx in range(total_saved, min(total_saved + frames_to_process, buffer_size)):
                             try:
@@ -551,8 +655,8 @@ class BrowserAutomationService:
                     is_complete = buffer_status.get('isComplete', False)
                     
                     if buffer_size > total_saved:
-                        # Process new frames
-                        frames_to_process = min(buffer_size - total_saved, 12)
+                        # Process new frames (optimized batch size for performance)
+                        frames_to_process = min(buffer_size - total_saved, 8)
                         
                         for frame_idx in range(total_saved, min(total_saved + frames_to_process, buffer_size)):
                             try:

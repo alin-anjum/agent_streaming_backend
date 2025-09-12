@@ -947,6 +947,7 @@ class RapidoMainSystem:
                         if self.use_dynamic_capture and self.slide_frame_count > 0:
                             # Use fast cached access - no disk I/O blocking
                             safe_slide_index = slide_frame_index % self.slide_frame_count
+                            # TODO: change this to use queue system
                             slide_frame = self.get_cached_slide_frame(safe_slide_index)
                             self.total_slide_frames = self.slide_frame_count  # Update for progress logging
                             if slide_frame_index % 25 == 0:  # Debug every second
