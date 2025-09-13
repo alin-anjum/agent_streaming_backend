@@ -1,0 +1,343 @@
+DYNAMIC FRAME CAPTURE IMPLEMENTATION PATCH
+==========================================
+
+This patch converts a static frame-based system to use dynamically captured frames
+from tab capture with real-time caching and SyncTalk-style queue management.
+
+=== FILE: rapido_main.py ===
+
+1. ADD DYNAMIC CAPTURE CONFIGURATION
+-----------------------------------
+In __init__ method, add after existing configuration:
+
+```python
+# Dynamic frame capture configuration
+self.use_dynamic_capture = getattr(self.config, 'USE_DYNAMIC_CAPTURE', False)
+self.capture_url = getattr(self.config, 'CAPTURE_URL', 'https://test.creatium.com/presentation')
+self.capture_duration = getattr(self.config, 'CAPTURE_DURATION', 30)
+
+# Real-time slide frame streaming (tab-capture) additions - EXACT SYNCTALK PATTERN
+# Mirror the exact SyncTalk pattern: asyncio.Queue with producer task
+# that watches the capture directory and feeds frames to a queue
+# for non-blocking consumption by the compositor.
+self.slide_frame_queue: Optional[asyncio.Queue] = None  # Created after capture starts
+self._slide_producer_task: Optional[asyncio.Task] = None
+self.slide_frames_cache = {}  # Cache loaded slide frames by index
+self.slide_frame_count = 0    # Current number of available slide frames
+self.dynamic_frame_processor = None
+self.dynamic_frames_dir = None  # Set after capture starts
+```
+
+2. MODIFY FRAME PROCESSOR INITIALIZATION
+---------------------------------------
+Replace existing frame processor initialization:
+
+```python
+# Initialize frame processor based on capture mode
+if self.use_dynamic_capture:
+    # For dynamic capture, create minimal processor for overlay operations only
+    logger.info("🎬 Dynamic capture mode - creating overlay-only processor")
+    # Create a dummy empty directory to avoid loading any static frames
+    import tempfile
+    temp_dir = tempfile.mkdtemp()
+    self.frame_processor = FrameOverlayEngine(temp_dir, output_size=(854, 480))
+    self.total_slide_frames = 0
+    self.total_duration_seconds = 0
+else:
+    # For static frames, load the presentation frames
+    logger.info("📁 Static frame mode - loading presentation frames")
+    self.frame_processor = FrameOverlayEngine(self.slide_frames_path, output_size=(854, 480))
+    self.total_slide_frames = self.frame_processor.get_frame_count()
+    self.total_duration_seconds = self.total_slide_frames / self.synctalk_fps
+```
+
+3. ADD DYNAMIC FRAME CAPTURE SETUP
+----------------------------------
+Add this method after existing methods:
+
+```python
+async def setup_dynamic_frame_capture(self):
+    """Setup dynamic frame capture system"""
+    if not self.use_dynamic_capture:
+        logger.info("📁 Using static frames")
+        return
+        
+    logger.info("🎬 Setting up dynamic frame capture...")
+    logger.info(f"🌐 Capturing from URL: {self.capture_url}")
+    logger.info(f"⏱️ Capture duration: {self.capture_duration} seconds")
+    
+    try:
+        # Start dynamic capture (non-blocking)
+        from tab_capture import capture_presentation_frames
+        self.dynamic_frames_dir = await capture_presentation_frames(
+            url=self.capture_url,
+            duration=self.capture_duration
+        )
+        logger.info("✅ Dynamic frame capture started in background")
+        logger.info(f"📁 Frames will be saved to: {self.dynamic_frames_dir}")
+        
+        # Wait for first few frames to be captured before proceeding
+        logger.info("⏳ Waiting for first slide frames to be captured...")
+        await self._wait_for_initial_frames()
+        
+        # For dynamic capture, we use the cache system instead of frame processor reloading
+        logger.info(f"🔄 Dynamic capture ready - using cache system for: {self.dynamic_frames_dir}")
+        # Keep original frame processor for overlay operations only
+        logger.info(f"📊 Dynamic capture setup completed - cache system active")
+        
+        logger.info("✅ Dynamic frame capture setup completed (non-blocking)")
+        
+    except Exception as e:
+        logger.error(f"❌ Dynamic frame capture setup failed: {e}")
+        raise
+```
+
+4. ADD FRAME WAITING LOGIC
+--------------------------
+```python
+async def _wait_for_initial_frames(self):
+    """Wait for initial frames to be captured before starting SyncTalk"""
+    frames_dir = Path(self.dynamic_frames_dir)
+    min_frames_needed = 3
+    max_wait_time = 30  # seconds
+    
+    start_time = time.time()
+    while (time.time() - start_time) < max_wait_time:
+        if frames_dir.exists():
+            frame_files = list(frames_dir.glob("frame_*.png"))
+            if len(frame_files) >= min_frames_needed:
+                logger.info(f"✅ Found {len(frame_files)} slide frames, ready to start SyncTalk!")
+                logger.info(f"📸 First frames: {[f.name for f in sorted(frame_files)[:3]]}")
+                return
+            else:
+                logger.info(f"⏳ Found {len(frame_files)}/{min_frames_needed} frames, waiting for more...")
+        else:
+            logger.info("⏳ Waiting for first slide frame to be captured...")
+        
+        await asyncio.sleep(1.0)
+    
+    raise Exception(f"Timeout waiting for initial frames after {max_wait_time}s")
+```
+
+5. ADD SLIDE FRAME PRODUCER (SyncTalk Pattern)
+---------------------------------------------
+```python
+async def _produce_slide_frames(self):
+    """
+    Producer task that watches dynamic capture directory and loads new frames into queue.
+    Mirrors the exact SyncTalk pattern for non-blocking frame delivery.
+    """
+    if not self.dynamic_frames_dir:
+        logger.error("❌ No dynamic frames directory set")
+        return
+        
+    logger.info(f"🎬 Starting slide frame producer for: {self.dynamic_frames_dir}")
+    frames_dir = Path(self.dynamic_frames_dir)
+    
+    processed_frames = set()  # Track which frames we've already processed
+    
+    while self.frame_delivery_running:
+        try:
+            # Find all PNG files in the directory
+            if frames_dir.exists():
+                frame_files = sorted(list(frames_dir.glob("frame_*.png")))
+                
+                # Process new frames only
+                for frame_file in frame_files:
+                    if frame_file.name not in processed_frames:
+                        try:
+                            # Load frame
+                            frame_image = Image.open(frame_file).resize((854, 480))
+                            frame_index = len(processed_frames)  # Use sequential index
+                            
+                            # Cache the frame
+                            self.slide_frames_cache[frame_index] = frame_image
+                            self.slide_frame_count = len(self.slide_frames_cache)
+                            
+                            # Add to processed set
+                            processed_frames.add(frame_file.name)
+                            
+                            # Log progress every 50 frames
+                            if len(processed_frames) % 50 == 0:
+                                logger.info(f"📈 Slide producer: {len(processed_frames)} frames cached")
+                                
+                        except Exception as e:
+                            logger.error(f"❌ Error loading slide frame {frame_file}: {e}")
+            
+            # Check every 100ms for new frames
+            await asyncio.sleep(0.1)
+            
+        except Exception as e:
+            logger.error(f"❌ Error in slide frame producer: {e}")
+            await asyncio.sleep(1.0)  # Wait longer on error
+            
+    logger.info("🛑 Slide frame producer stopped")
+
+def get_cached_slide_frame(self, frame_index: int) -> Optional[Image.Image]:
+    """Get slide frame from cache - non-blocking like SyncTalk"""
+    if frame_index in self.slide_frames_cache:
+        return self.slide_frames_cache[frame_index]
+    
+    # If frame doesn't exist, cycle through available frames
+    if self.slide_frame_count > 0:
+        safe_index = frame_index % self.slide_frame_count
+        return self.slide_frames_cache.get(safe_index)
+        
+    return None
+```
+
+6. MODIFY TTS STREAMING TO START SLIDE PRODUCER
+----------------------------------------------
+In stream_real_time_tts method, add after frame_delivery_task creation:
+
+```python
+# Start slide frame producer for dynamic capture - EXACT SYNCTALK PATTERN
+if self.use_dynamic_capture:
+    logger.info("🎬 Starting slide frame producer (background)...")
+    self._slide_producer_task = asyncio.create_task(self._produce_slide_frames())
+```
+
+7. MODIFY CONTINUOUS FRAME DELIVERY
+----------------------------------
+Replace slide frame access in continuous_frame_delivery:
+
+```python
+# Get slide frame - FAST CACHED ACCESS for dynamic capture
+if self.use_dynamic_capture and self.slide_frame_count > 0:
+    # Use fast cached access - no disk I/O blocking
+    safe_slide_index = slide_frame_index % self.slide_frame_count
+    slide_frame = self.get_cached_slide_frame(safe_slide_index)
+    self.total_slide_frames = self.slide_frame_count  # Update for progress logging
+else:
+    # Fallback to frame processor for static frames
+    current_frame_count = frame_processor.get_frame_count()
+    if current_frame_count > 0:
+        safe_slide_index = slide_frame_index % current_frame_count
+        self.total_slide_frames = current_frame_count
+    else:
+        safe_slide_index = 0
+    slide_frame = frame_processor.get_slide_frame(safe_slide_index)
+```
+
+8. UPDATE PROCESS PRESENTATION METHOD
+------------------------------------
+In process_presentation method, add after LiveKit connection:
+
+```python
+# Step 2.5: Setup frame capture (static or dynamic)
+logger.info("🎬 Setting up frame capture...")
+await self.setup_dynamic_frame_capture()
+```
+
+9. ADD ENHANCED FPS MONITORING
+-----------------------------
+Add these tracking variables to __init__:
+
+```python
+# SyncTalk frame production monitoring - SEPARATE FROM COMPOSITION
+self.synctalk_frame_count = 0
+self.synctalk_start_time = None
+self.synctalk_last_log_time = None
+self.synctalk_last_frame_count = 0
+
+# Composition/delivery monitoring - SEPARATE FROM SYNCTALK
+self.composition_frame_count = 0
+self.composition_start_time = None
+```
+
+Replace SyncTalk FPS logging in process_audio_chunk:
+
+```python
+# MONITOR SYNCTALK PRODUCTION RATE - REAL-TIME FPS TRACKING
+self.synctalk_frame_count += 1
+current_time = time.time()
+
+if self.synctalk_start_time is None:
+    self.synctalk_start_time = current_time
+    self.synctalk_last_log_time = current_time
+    self.synctalk_last_frame_count = 0
+
+# Log SyncTalk FPS every 3 seconds for real-time monitoring
+if current_time - self.synctalk_last_log_time >= 3.0:
+    # Calculate recent FPS (last 3 seconds)
+    recent_frames = self.synctalk_frame_count - self.synctalk_last_frame_count
+    recent_fps = recent_frames / (current_time - self.synctalk_last_log_time)
+    
+    # Calculate overall FPS
+    overall_fps = self.synctalk_frame_count / (current_time - self.synctalk_start_time)
+    
+    status = "🟢" if recent_fps >= 20 else "🟡" if recent_fps >= 10 else "🔴"
+    logger.info(f"🤖 SYNCTALK FPS: {recent_fps:.1f} recent | {overall_fps:.1f} avg {status} (total: {self.synctalk_frame_count})")
+    
+    # Update for next calculation
+    self.synctalk_last_log_time = current_time
+    self.synctalk_last_frame_count = self.synctalk_frame_count
+```
+
+=== FILE: frame_processor.py ===
+
+SIMPLIFY get_slide_frame method (remove dynamic reloading):
+
+```python
+def get_slide_frame(self, frame_index: int) -> Optional[Image.Image]:
+    """Get slide frame by index - STATIC FRAMES ONLY (dynamic uses cache)."""
+    # For static frames, just return from loaded frames
+    if frame_index >= len(self.slide_frames) and len(self.slide_frames) > 0:
+        frame_index = frame_index % len(self.slide_frames)
+    
+    return self.slide_frames.get(frame_index)
+```
+
+DISABLE cache loading for dynamic capture in __init__:
+
+```python
+# For dynamic capture, always load fresh (no cache) to ensure real-time updates
+logger.info(f"🔍 Looking for frames in: {self.slide_frames_path.resolve()}")
+self.load_slide_frames()
+if len(self.slide_frames) > 0:
+    # Save to cache for static frames, but dynamic frames will reload as needed
+    self.save_to_cache()
+else:
+    logger.error(f"❌ No frames loaded! Check path: {self.slide_frames_path}")
+```
+
+=== FILE: config.py ===
+
+ADD configuration options:
+
+```python
+# Dynamic frame capture settings
+USE_DYNAMIC_CAPTURE = True  # Set to False for static frames
+CAPTURE_URL = "http://localhost:5173/video-capture/your-id"
+CAPTURE_DURATION = 30  # seconds
+```
+
+=== DEPENDENCIES ===
+
+Ensure these imports are added:
+
+```python
+from tab_capture import capture_presentation_frames, DynamicFrameProcessor
+from pathlib import Path
+import tempfile
+```
+
+=== PERFORMANCE OPTIMIZATIONS ===
+
+1. **No Static Frame Loading**: When USE_DYNAMIC_CAPTURE=True, no static frames are loaded
+2. **Real-time Caching**: Frames are cached as they're captured, not reloaded from disk
+3. **SyncTalk Pattern**: Uses the same queue/producer pattern as SyncTalk for smooth delivery
+4. **Separate FPS Monitoring**: Clear separation between SyncTalk FPS and composition FPS
+5. **Non-blocking Operations**: All frame operations are non-blocking to maintain 25 FPS
+
+=== TESTING ===
+
+1. Set USE_DYNAMIC_CAPTURE=True in config
+2. Ensure tab capture system is available
+3. Run the system and monitor logs:
+   - "🤖 SYNCTALK FPS: X.X recent | X.X avg 🟢" - SyncTalk performance
+   - "🎬 COMPOSITION FPS: X.X recent | X.X avg 🟢" - Overall performance
+   - "📈 Slide producer: X frames cached" - Dynamic frame loading
+   - "📊 Slide progress: X/Y (cycle Z, frame N) - CACHED" - Frame usage
+
+Expected performance: Both SyncTalk and Composition FPS should be 20-25 FPS consistently.

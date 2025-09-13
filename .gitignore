@@ -22,6 +22,7 @@ wheels/
 MANIFEST
 
 # Virtual Environment
+.venv/
 venv/
 env/
 ENV/
@@ -49,6 +50,11 @@ logs/
 temp/
 tmp/
 *.tmp
+
+# Unnecessary files
+captured_frames/
+browser_data/
+.browser_run_count
 
 # OS
 .DS_Store

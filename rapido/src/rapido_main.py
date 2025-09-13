@@ -25,6 +25,8 @@ import argparse
 import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
+import tempfile
 try:
     import torch
     TORCH_AVAILABLE = torch.cuda.is_available()
@@ -119,7 +121,7 @@ class RapidoMainSystem:
                 setattr(self.config, key, value)
         
         # Setup paths and connections - use remote SyncTalk server
-        self.synctalk_url = getattr(self.config, 'SYNCTALK_WEBSOCKET_URL', 'ws://35.172.212.10:8000')
+        self.synctalk_url = getattr(self.config, 'SYNCTALK_WEBSOCKET_URL', 'ws://35.172.212.10:8000/ws')
         self.websocket = None
         self.aiohttp_session = None
         self.audio_send_queue = None
@@ -167,8 +169,38 @@ class RapidoMainSystem:
             self.device = torch.device('cpu')
             logger.info("💻 Using CPU for frame processing")
             
-        self.frame_processor = FrameOverlayEngine(self.slide_frames_path, output_size=(854, 480))
-        self.total_slide_frames = self.frame_processor.get_frame_count()
+        # Dynamic frame capture configuration
+        self.use_dynamic_capture = getattr(self.config, 'USE_DYNAMIC_CAPTURE', False)
+        self.capture_url = getattr(self.config, 'CAPTURE_URL', 'https://test.creatium.com/presentation')
+
+        # Real-time slide frame streaming (tab-capture) additions - EXACT SYNCTALK PATTERN
+        # Mirror the exact SyncTalk pattern: asyncio.Queue with producer task
+        # that watches the capture directory and feeds frames to a queue
+        # for non-blocking consumption by the compositor.
+        self.slide_frame_queue: Optional[asyncio.Queue] = None  # Created after capture starts
+        self._slide_producer_task: Optional[asyncio.Task] = None
+        self.slide_frames_cache = {}  # Cache loaded slide frames by index
+        self.slide_frame_count = 0    # Current number of available slide frames
+        self.max_cached_frames = 1000  # Limit cache size to prevent memory issues
+        self._cache_lock = asyncio.Lock()  # Thread safety for cache operations
+        self.dynamic_frame_processor = None
+        self.dynamic_frames_dir = None  # Set after capture starts
+
+        # Initialize frame processor based on capture mode
+        if self.use_dynamic_capture:
+            # For dynamic capture, create minimal processor for overlay operations only
+            logger.info("🎬 Dynamic capture mode - creating overlay-only processor")
+            # Create a dummy empty directory to avoid loading any static frames
+            import tempfile
+            temp_dir = tempfile.mkdtemp()
+            self.frame_processor = FrameOverlayEngine(temp_dir, output_size=(854, 480), dynamic_mode=True)
+            self.total_slide_frames = 0
+            self.total_duration_seconds = 0
+        else:
+            # For static frames, load the presentation frames
+            logger.info("📁 Static frame mode - loading presentation frames")
+            self.frame_processor = FrameOverlayEngine(self.slide_frames_path, output_size=(854, 480))
+            self.total_slide_frames = self.frame_processor.get_frame_count()
         self.total_duration_seconds = self.total_slide_frames / self.synctalk_fps
         
         # Initialize chroma key processor
@@ -401,8 +433,8 @@ class RapidoMainSystem:
     async def connect_to_synctalk(self, avatar_name="enrique_torres", sample_rate=16000):
         """Connect to SyncTalk server using DECOUPLED architecture for maximum performance"""
         # Build optimized WebSocket URL with correct endpoint
-        base_url = self.synctalk_url.replace('ws://', 'http://').replace('wss://', 'https://')
-        ws_url = f"ws://{base_url.split('://', 1)[1]}/ws/audio_to_video"  # FIXED: Added /ws/ prefix
+        # Replace /ws with /ws/audio_to_video to get the correct endpoint
+        ws_url = self.synctalk_url.replace('/ws', '/ws/audio_to_video')
         params = {
             "avatar_name": avatar_name,
             "sample_rate": str(sample_rate)
@@ -528,9 +560,9 @@ class RapidoMainSystem:
             import time
             
             # LiveKit credentials
-            LIVEKIT_URL = "wss://agent-s83m6c4y.livekit.cloud"
-            LIVEKIT_API_KEY = "APIEkRN4enNfAzu"
-            LIVEKIT_API_SECRET = "jHEYfEfhaBWQg5isdDgO6e2Xw8zhIvb18KebGwH2ESXC"
+            LIVEKIT_URL = "wss://rapido-pme0lo9d.livekit.cloud"
+            LIVEKIT_API_KEY = "APImuXsSp8NH5jY"
+            LIVEKIT_API_SECRET = "6k9Swe5O6NxeI0WvVTCTrs2k1Ec25byeM4NlnTCKn5GB"
             
             # Generate JWT token
             current_time = int(time.time())
@@ -696,12 +728,12 @@ class RapidoMainSystem:
             import time
             
             # LiveKit credentials
-            LIVEKIT_URL = "wss://agent-s83m6c4y.livekit.cloud"
-            LIVEKIT_API_KEY = "APIEkRN4enNfAzu"
-            LIVEKIT_API_SECRET = "jHEYfEfhaBWQg5isdDgO6e2Xw8zhIvb18KebGwH2ESXC"
+            LIVEKIT_URL = "wss://rapido-pme0lo9d.livekit.cloud"
+            LIVEKIT_API_KEY = "APImuXsSp8NH5jY"
+            LIVEKIT_API_SECRET = "6k9Swe5O6NxeI0WvVTCTrs2k1Ec25byeM4NlnTCKn5GB"
             
             # Get room name from config
-            room_name = getattr(self.config, 'LIVEKIT_ROOM', 'avatar_room')
+            room_name = getattr(self.config, 'LIVEKIT_ROOM', 'avatar-room2')
             logger.info(f"🏠 Legacy LiveKit connecting to room: {room_name}")
             
             # Generate JWT token
@@ -772,9 +804,15 @@ class RapidoMainSystem:
         self.frame_delivery_running = True
         self.frame_delivery_task = None
         
-        # SyncTalk frame production monitoring
+        # SyncTalk frame production monitoring - SEPARATE FROM COMPOSITION
         self.synctalk_frame_count = 0
         self.synctalk_start_time = None
+        self.synctalk_last_log_time = None
+        self.synctalk_last_frame_count = 0
+
+        # Composition/delivery monitoring - SEPARATE FROM SYNCTALK
+        self.composition_frame_count = 0
+        self.composition_start_time = None
         
         # Track audio chunks sent vs frames received for proper end marker timing
         self.audio_chunks_sent = 0
@@ -816,6 +854,9 @@ class RapidoMainSystem:
         self.frame_delivery_task = asyncio.create_task(
             self.continuous_frame_delivery(frame_processor)
         )
+        
+        # Note: For dynamic capture, frames are now fed directly to queue by browser service
+        # No separate slide frame producer task needed since browser feeds queue directly
         
         # Start real-time streaming
         logger.info("🎭 Starting OPTIMIZED REAL-TIME audio streaming with 160ms chunks...")
@@ -1059,11 +1100,46 @@ class RapidoMainSystem:
                         frame = frame_data["frame"]
                         audio = frame_data["audio"]
                         
-                        # Get current slide frame with proper cycling
-                        safe_slide_index = slide_frame_index % self.total_slide_frames
-                        slide_frame = frame_processor.get_slide_frame(safe_slide_index)
+                        # Get slide frame from slide_frame_queue with same buffer logic as avatar frames
+                        slide_frame = None
+                        slide_frame_available = False
                         
-                        if slide_frame:
+                        if self.slide_frame_queue and not self.slide_frame_queue.empty():
+                            try:
+                                # Get slide frame from queue (non-blocking)
+                                slide_frame_index_from_queue, slide_frame = self.slide_frame_queue.get_nowait()
+                                slide_frame_available = True
+                                self.last_slide_frame = slide_frame  # Save for potential duplication
+                                self.last_slide_frame_index = slide_frame_index_from_queue
+                                
+                                if slide_frame_index % 25 == 0:  # Debug every second
+                                    queue_size = self.slide_frame_queue.qsize()
+                                    logger.info(f"🎬 QUEUE: Using slide frame {slide_frame_index_from_queue} (queue: {queue_size} frames)")
+                                    
+                            except asyncio.QueueEmpty:
+                                slide_frame_available = False
+                        
+                        # If no frame available from queue, use duplication logic like avatar frames
+                        if not slide_frame_available:
+                            if hasattr(self, 'last_slide_frame') and self.last_slide_frame is not None:
+                                # Duplicate last slide frame for smooth playback
+                                slide_frame = self.last_slide_frame.copy()
+                                if slide_frame_index % 25 == 0:  # Debug every second
+                                    queue_size = self.slide_frame_queue.qsize() if self.slide_frame_queue else 0
+                                    logger.info(f"🎬 🔄 SLIDE QUEUE EMPTY - duplicating last slide frame (queue: {queue_size})")
+                            else:
+                                # Fallback to frame processor for initial frames or when no queue available
+                                current_frame_count = frame_processor.get_frame_count()
+                                if current_frame_count > 0:
+                                    safe_slide_index = slide_frame_index % current_frame_count
+                                    self.total_slide_frames = current_frame_count
+                                else:
+                                    safe_slide_index = 0
+                                slide_frame = frame_processor.get_slide_frame(safe_slide_index)
+                                if slide_frame_index % 25 == 0:  # Debug every second
+                                    logger.info(f"🎬 FALLBACK: Using frame processor {safe_slide_index}/{current_frame_count} (no queue frames available)")
+                        
+                        if slide_frame is not None:
                             # FAST COMPOSITION with performance tracking
                             composition_start = time.time()
                             composed_frame = frame_processor.overlay_avatar_on_slide(
@@ -1161,9 +1237,11 @@ class RapidoMainSystem:
                             
                             # Log progress and performance
                             if frame_count % 50 == 0:
-                                cycle_count = slide_frame_index // self.total_slide_frames
-                                current_slide = safe_slide_index
-                                logger.info(f"📊 Slide progress: {current_slide}/{self.total_slide_frames} (cycle {cycle_count + 1}, frame {frame_count})")
+                                # Show slide frame queue status instead of cache-based progress
+                                slide_queue_size = self.slide_frame_queue.qsize() if self.slide_frame_queue else 0
+                                current_slide_info = f"{getattr(self, 'last_slide_frame_index', 'N/A')}" if hasattr(self, 'last_slide_frame_index') else "N/A"
+                                queue_indicator = " - QUEUE" if slide_frame_available else " - DUPLICATED" if hasattr(self, 'last_slide_frame') else " - FALLBACK"
+                                logger.info(f"📊 Slide progress: Frame {current_slide_info} (queue: {slide_queue_size}, output frame {frame_count}){queue_indicator}")
                             
                             if frame_count % 25 == 0:  # Log every second  
                                 elapsed_time = current_time - self.frame_delivery_start_time
@@ -1171,21 +1249,37 @@ class RapidoMainSystem:
                                 fps_diff = sustained_fps - target_fps
                                 status = "✅" if abs(fps_diff) < 1.0 else "⚠️"
                                 
-                                # New color coding for intake buffer status
+                                # Buffer status for both avatar and slide frames
                                 if intake_size > 30:
-                                    buffer_status = "🟢"  # Plenty of buffer
+                                    avatar_buffer_status = "🟢"  # Plenty of buffer
                                 elif intake_size > 10:
-                                    buffer_status = "🟡"  # Getting low but still safe
+                                    avatar_buffer_status = "🟡"  # Getting low but still safe
                                 elif intake_size > 0:
-                                    buffer_status = "🟠"  # Very low but still have frames
+                                    avatar_buffer_status = "🟠"  # Very low but still have frames
                                 else:
-                                    buffer_status = "🔄"  # Duplicating frames
-                                logger.info(f"🎬 {status} SUSTAINED: {sustained_fps:.1f}/{target_fps} FPS (diff: {fps_diff:+.1f}) {buffer_status} intake: {intake_size} frames")
+                                    avatar_buffer_status = "🔄"  # Duplicating frames
+                                
+                                # Slide frame buffer status
+                                slide_queue_size = self.slide_frame_queue.qsize() if self.slide_frame_queue else 0
+                                if slide_queue_size > 30:
+                                    slide_buffer_status = "🟢"
+                                elif slide_queue_size > 10:
+                                    slide_buffer_status = "🟡"
+                                elif slide_queue_size > 0:
+                                    slide_buffer_status = "🟠"
+                                else:
+                                    slide_buffer_status = "🔄"
+                                
+                                logger.info(f"🎬 {status} SUSTAINED: {sustained_fps:.1f}/{target_fps} FPS (diff: {fps_diff:+.1f}) {avatar_buffer_status} avatar: {intake_size} | {slide_buffer_status} slide: {slide_queue_size}")
                         
-                        # Mark task as done - frame successfully processed and output
-                        # Only mark as done if we actually got a frame from intake (not duplicated)
+                        # Mark tasks as done - frames successfully processed and output
+                        # Only mark as done if we actually got frames from queues (not duplicated)
                         if not is_duplicated_frame:
                             self.intake_queue.task_done()
+                        
+                        # Mark slide frame task as done if we got it from queue
+                        if slide_frame_available and self.slide_frame_queue:
+                            self.slide_frame_queue.task_done()
                         
                 except asyncio.CancelledError:
                     break
@@ -1672,7 +1766,7 @@ class RapidoMainSystem:
             
         # Log first few calls for debugging only
         if self._frame_count < 3:
-            logger.info(f"🎨 Processing alin avatar frame {self._frame_count} for green screen removal")
+            logger.info(f"🎨 Processing alin avatar frame {self._frame_count} for green screen removal (targeting #C2FFB6)")
             self._frame_count += 1
         
         # Convert image to numpy array (needed for final RGBA creation)
@@ -1700,14 +1794,23 @@ class RapidoMainSystem:
                     (g - target_color[1]) ** 2 +
                     (b - target_color[2]) ** 2
                 )
-                color_similar = color_diff < 40  # Tighter threshold for specific green
+                # Much tighter threshold to avoid removing avatar parts
+                color_similar = color_diff < 25  # Reduced from 50 to 25
                 
-                # Detect the specific darker green #089831
-                # R: 8 (very low), G: 152 (medium-high), B: 49 (low)
-                specific_green = (r < 50) & (g > 120) & (g < 180) & (b < 80)
+                # More specific detection for the exact light green background
+                # #C2FFB6: R=194, G=255, B=182 - very specific ranges
+                exact_green = (g > 240) & (g < 260) & (r > 180) & (r < 210) & (b > 170) & (b < 195)
                 
-                # Combine conditions on GPU - simpler for darker green
-                is_green = (green_dominant & color_similar) | specific_green
+                # Only remove pixels that are very close to the exact background color
+                # AND have green dominance (G channel significantly higher than R and B)
+                green_dominant = (g > r + 30) & (g > b + 40)  # Green must be much higher
+                
+                # Protect skin tones and avatar parts - exclude pixels that look like skin/clothing
+                likely_skin = (r > 100) & (r < 255) & (g > 80) & (g < 200) & (b > 60) & (b < 180) & (r > g - 20)
+                likely_clothing = (r < 100) & (g < 100) & (b < 100)  # Dark colors like suits
+                
+                # Combine conditions - much more restrictive AND avoid avatar parts
+                is_green = color_similar & (exact_green | green_dominant) & (~likely_skin) & (~likely_clothing)
                 
                 # Create alpha channel on GPU and move back to CPU
                 alpha = (~is_green).float() * 255.0
@@ -1718,31 +1821,45 @@ class RapidoMainSystem:
                 # Fallback to CPU processing
                 target_color = np.array([188, 254, 182], dtype=np.uint8)
                 r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
-                green_dominant = (g > r + 20) & (g > b + 20)  # Green must be significantly higher
+                
                 color_diff = np.sqrt(
                     (r.astype(np.int16) - target_color[0]) ** 2 +
                     (g.astype(np.int16) - target_color[1]) ** 2 +
                     (b.astype(np.int16) - target_color[2]) ** 2
                 )
-                color_similar = color_diff < 40  # Tighter threshold
-                # Detect the specific darker green #089831
-                specific_green = (r < 50) & (g > 120) & (g < 180) & (b < 80)
-                is_green = (green_dominant & color_similar) | specific_green
+                color_similar = color_diff < 25  # Much tighter threshold
+                
+                # More specific detection for exact background color
+                exact_green = (g > 240) & (g < 260) & (r > 180) & (r < 210) & (b > 170) & (b < 195)
+                green_dominant = (g > r + 30) & (g > b + 40)  # Green must be much higher
+                
+                # Protect skin tones and avatar parts
+                likely_skin = (r > 100) & (r < 255) & (g > 80) & (g < 200) & (b > 60) & (b < 180) & (r > g - 20)
+                likely_clothing = (r < 100) & (g < 100) & (b < 100)  # Dark colors like suits
+                
+                is_green = color_similar & (exact_green | green_dominant) & (~likely_skin) & (~likely_clothing)
                 alpha = (~is_green).astype(np.uint8) * 255
         else:
             # CPU processing
-            target_color = np.array([8, 152, 49], dtype=np.uint8)
+            target_color = np.array([194, 255, 182], dtype=np.uint8)  # #C2FFB6
             r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
-            green_dominant = (g > r + 20) & (g > b + 20)  # Green must be significantly higher
+            
             color_diff = np.sqrt(
                 (r.astype(np.int16) - target_color[0]) ** 2 +
                 (g.astype(np.int16) - target_color[1]) ** 2 +
                 (b.astype(np.int16) - target_color[2]) ** 2
             )
-            color_similar = color_diff < 40  # Tighter threshold
-            # Detect the specific darker green #089831
-            specific_green = (r < 50) & (g > 120) & (g < 180) & (b < 80)
-            is_green = (green_dominant & color_similar) | specific_green
+            color_similar = color_diff < 25  # Much tighter threshold
+            
+            # More specific detection for exact background color
+            exact_green = (g > 240) & (g < 260) & (r > 180) & (r < 210) & (b > 170) & (b < 195)
+            green_dominant = (g > r + 30) & (g > b + 40)  # Green must be much higher
+            
+            # Protect skin tones and avatar parts
+            likely_skin = (r > 100) & (r < 255) & (g > 80) & (g < 200) & (b > 60) & (b < 180) & (r > g - 20)
+            likely_clothing = (r < 100) & (g < 100) & (b < 100)  # Dark colors like suits
+            
+            is_green = color_similar & (exact_green | green_dominant) & (~likely_skin) & (~likely_clothing)
             alpha = (~is_green).astype(np.uint8) * 255
         
         # Morphological operations for smooth edges
@@ -1752,7 +1869,7 @@ class RapidoMainSystem:
         # Smooth the alpha channel
         alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, self._morph_kernel)
         alpha = cv2.morphologyEx(alpha, cv2.MORPH_OPEN, self._morph_kernel)
-        alpha = cv2.GaussianBlur(alpha, (3, 3), 1.0)
+        alpha = cv2.GaussianBlur(alpha, (5, 5), 1.5)  # Slightly more blur for smoother edges
         
         # Create RGBA image
         rgba_array = np.dstack((img_array, alpha))
@@ -1789,6 +1906,183 @@ class RapidoMainSystem:
         except Exception as e:
             logger.warning(f"Async green screen removal failed: {e}")
             return image  # Return original image on failure
+    
+    async def setup_dynamic_frame_capture(self):
+        """Setup dynamic frame capture system"""
+        if not self.use_dynamic_capture:
+            logger.info("📁 Using static frames")
+            return
+            
+        logger.info("🎬 Setting up dynamic frame capture...")
+        logger.info(f"🌐 Capturing from URL: {self.capture_url}")
+        logger.info("⏱️ Capture will end automatically when presentation finishes")
+        
+        # Initialize slide frame queue for real-time frame capture
+        if self.slide_frame_queue is None:
+            self.slide_frame_queue = asyncio.Queue(maxsize=200)  # Buffer up to 100 slide frames
+            logger.info("📥 Slide frame queue initialized (maxsize: 100)")
+        
+        try:
+            # Start dynamic capture (direct to queue - no file system)
+            from tab_capture.capture_api import capture_presentation_frames_to_queue
+            success = await capture_presentation_frames_to_queue(
+                capture_url=self.capture_url,
+                frame_queue=self.slide_frame_queue
+            )
+            
+            if not success:
+                raise Exception("Failed to start dynamic frame capture - could not initialize browser")
+                
+            logger.info("✅ Dynamic frame capture started in background")
+            logger.info("📥 Frames will be fed directly to queue (no file system)")
+            
+            # No need for file watcher since frames are fed directly to queue
+            # The browser service will populate slide_frame_queue directly
+            
+            # Wait for first few frames to be queued before proceeding
+            logger.info("⏳ Waiting for first slide frames to be queued...")
+            await self._wait_for_initial_frames()
+            
+            # For dynamic capture, we use the queue system with direct feeding
+            logger.info("🔄 Dynamic capture ready - using direct queue feeding system")
+            
+            logger.info("✅ Dynamic frame capture setup completed (non-blocking)")
+            
+        except Exception as e:
+            logger.error(f"❌ Dynamic frame capture setup failed: {e}")
+            raise
+    
+    async def _wait_for_initial_frames(self):
+        """Wait for initial frames to be populated in slide_frame_queue before starting SyncTalk"""
+        min_frames_needed = 3
+        max_wait_time = 30  # seconds
+        
+        if not self.slide_frame_queue:
+            raise Exception("slide_frame_queue not initialized - cannot wait for frames")
+        
+        logger.info(f"⏳ Waiting for {min_frames_needed} frames to be queued...")
+        
+        start_time = time.time()
+        while (time.time() - start_time) < max_wait_time:
+            queue_size = self.slide_frame_queue.qsize()
+            
+            if queue_size >= min_frames_needed:
+                logger.info(f"✅ Found {queue_size} frames in queue, ready to start SyncTalk!")
+                return
+            
+            elapsed = time.time() - start_time
+            logger.info(f"⏳ Queue has {queue_size}/{min_frames_needed} frames - {elapsed:.1f}s elapsed")
+            await asyncio.sleep(1.0)
+        
+        # Timeout - check final count
+        final_queue_size = self.slide_frame_queue.qsize()
+        raise Exception(f"Timeout waiting for initial frames after {max_wait_time}s - only got {final_queue_size}/{min_frames_needed}")
+    
+    async def _watch_and_queue_frames(self):
+        """
+        DEPRECATED: Real-time file watcher that immediately queues frames as they are created in the capture directory.
+        This method is no longer used since we now feed frames directly from browser to queue.
+        Uses polling with minimal delay to catch frames as soon as they're written.
+        """
+        logger.warning("⚠️ _watch_and_queue_frames is deprecated - using direct queue feeding instead")
+        return
+        
+        if not self.dynamic_frames_dir:
+            logger.error("❌ No dynamic frames directory set")
+            return
+            
+        logger.info(f"🎬 Starting real-time frame watcher for: {self.dynamic_frames_dir}")
+        frames_dir = Path(self.dynamic_frames_dir)
+        
+        processed_frames = set()  # Track which frames we've already processed
+        frame_index_counter = 0  # Sequential counter for proper indexing
+        last_frame_count = 0  # Track directory changes
+        
+        while self.frame_delivery_running:
+            try:
+                # Find all PNG files in the directory with fast detection
+                if frames_dir.exists():
+                    frame_files = sorted(list(frames_dir.glob("frame_*.png")))
+                    current_frame_count = len(frame_files)
+                    
+                    # Only process if we have new frames (performance optimization)
+                    if current_frame_count > last_frame_count:
+                        # Process only the new frames
+                        for frame_file in frame_files:
+                            if frame_file.name not in processed_frames:
+                                try:
+                                    # Check for duplicate frames by file size (basic deduplication)
+                                    file_size = frame_file.stat().st_size
+                                    if file_size < 1000:  # Skip very small files (likely corrupted)
+                                        logger.debug(f"⚠️ Skipping small file: {frame_file.name} ({file_size} bytes)")
+                                        processed_frames.add(frame_file.name)  # Mark as processed to avoid retry
+                                        continue
+                                    
+                                    # Load frame with better error handling
+                                    frame_image = Image.open(frame_file).resize((854, 480))
+
+                                    if frame_image is not None:                                    
+                                        # Put frame in slide_frame_queue instead of cache
+                                        try:
+                                            self.slide_frame_queue.put_nowait((frame_index_counter, frame_image))
+                                            self.slide_frame_count = frame_index_counter + 1
+                                            
+                                        except asyncio.QueueFull:
+                                            # If queue is full, remove oldest frame and add new one
+                                            try:
+                                                self.slide_frame_queue.get_nowait()  # Remove oldest
+                                                self.slide_frame_queue.put_nowait((frame_index_counter, frame_image))
+                                            except asyncio.QueueEmpty:
+                                                pass
+                                        
+                                        # Add to processed set
+                                        processed_frames.add(frame_file.name)
+                                        frame_index_counter += 1
+                                        
+                                        # Log progress every 25 frames
+                                        if frame_index_counter % 25 == 0:
+                                            queue_size = self.slide_frame_queue.qsize()
+                                            logger.info(f"📈 Real-time watcher: {frame_index_counter} frames queued (queue size: {queue_size})")
+                                    else:
+                                        logger.warning(f"⚠️ Could not load frame: {frame_file}")
+                                        processed_frames.add(frame_file.name)
+                                    
+                                except Exception as e:
+                                    logger.error(f"❌ Error loading slide frame {frame_file}: {e}")
+                                    # Mark as processed to avoid infinite retry, but don't increment counter
+                                    processed_frames.add(frame_file.name)
+                                    # Add retry logic for network/IO issues
+                                    if "Permission denied" in str(e) or "being used by another process" in str(e):
+                                        logger.info(f"🔄 Will retry {frame_file.name} in next cycle")
+                                        processed_frames.discard(frame_file.name)  # Allow retry
+                        
+                        # Update last frame count after processing
+                        last_frame_count = current_frame_count
+                
+                # Fast polling for real-time detection (25ms = 40fps detection rate)
+                await asyncio.sleep(0.025)
+                
+            except Exception as e:
+                logger.error(f"❌ Error in slide frame producer: {e}")
+                await asyncio.sleep(1.0)  # Wait longer on error
+                
+        logger.info("🛑 Real-time frame watcher stopped")
+
+    def get_cached_slide_frame(self, frame_index: int) -> Optional[Image.Image]:
+        """Get slide frame from cache - non-blocking like SyncTalk"""
+        # Create a snapshot of cache to avoid race conditions
+        cache_snapshot = dict(self.slide_frames_cache)
+        frame_count_snapshot = self.slide_frame_count
+        
+        if frame_index in cache_snapshot:
+            return cache_snapshot[frame_index]
+        
+        # If frame doesn't exist, cycle through available frames
+        if frame_count_snapshot > 0:
+            safe_index = frame_index % frame_count_snapshot
+            return cache_snapshot.get(safe_index)
+            
+        return None
     
     def remove_green_screen_with_despill(self, image: Image.Image) -> Image.Image:
         """Apply chroma key with despill factor to prevent background meshing"""
@@ -1876,6 +2170,10 @@ class RapidoMainSystem:
             except Exception as e:
                 logger.warning(f"⚠️ LiveKit connection failed, continuing without LiveKit: {e}")
                 # Continue without LiveKit for testing
+            
+            # Step 2.5: Setup frame capture (static or dynamic)
+            logger.info("🎬 Setting up frame capture...")
+            await self.setup_dynamic_frame_capture()
             
             # Step 3: Connect to SyncTalk
             logger.info("🔌 Connecting to SyncTalk...")
@@ -2093,6 +2391,8 @@ class RapidoMainSystem:
             logger.error(f"❌ Processing failed: {e}")
             raise
         finally:
+            # Note: No slide producer task cleanup needed since browser service handles frame feeding directly
+            
             # Cleanup connections properly
             if hasattr(self, 'audio_processor_task') and self.audio_processor_task:
                 self.audio_processor_task.cancel()
@@ -2127,7 +2427,7 @@ async def main():
     
     parser = argparse.ArgumentParser(description="Rapido - Avatar Video Generation")
     parser.add_argument("--input", "-i", default=str(project_root / "test1.json"), help="Input JSON file")
-    parser.add_argument("--frames", "-f", default=str(project_root / "presentation_frames"), help="Slide frames directory")
+    parser.add_argument("--frames", "-f", default=r"C:\Work\agent-backend\custom_capture\new_frame", help="Slide frames directory")
     parser.add_argument("--output", "-o", default="./output", help="Output directory")
     parser.add_argument("--api-key", help="ElevenLabs API key")
     parser.add_argument("--avatar-scale", type=float, default=0.5, help="Avatar scale")
