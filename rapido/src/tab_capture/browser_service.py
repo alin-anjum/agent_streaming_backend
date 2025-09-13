@@ -150,6 +150,20 @@ class BrowserAutomationService:
         logger.info(f"📁 Created frames directory: {frames_dir}")
         return frames_dir
 
+    async def capture_frames_live_to_queue(self, duration_seconds: int, frame_queue: "asyncio.Queue"):
+        """Capture frames live and feed directly to queue (no file system)"""
+        try:
+            logger.info(f"🎬 Starting live frame capture for {duration_seconds} seconds (direct to queue)")
+            
+            # Use slide capture method but feed to queue instead of directory
+            await self._automated_play_and_slide_capture_to_queue(duration_seconds, frame_queue)
+            
+            logger.info(f"✅ Live capture completed - frames fed to queue")
+                
+        except Exception as e:
+            logger.error(f"❌ Live frame capture to queue failed: {e}")
+            raise
+
     async def capture_frames_live_to_directory(self, duration_seconds: int, target_directory: str):
         """Capture frames live and save to specific directory"""
         try:
@@ -270,6 +284,83 @@ class BrowserAutomationService:
             
         except Exception as e:
             logger.error(f"❌ Failed to install slide capture hooks: {e}")
+            raise
+
+    async def _automated_play_and_slide_capture_to_queue(self, duration: int, frame_queue: "asyncio.Queue"):
+        """Automated play button click and slide capture monitoring directly to queue"""
+        try:
+            logger.info("🎬 Starting automated play and slide capture (direct to queue)...")
+            
+            # First, look for play button
+            logger.info("🔍 Looking for play button on the webpage...")
+            
+            play_button_selectors = [
+                'button[class*="play"]',
+                'button[aria-label*="play" i]',
+                'button[title*="play" i]', 
+                'button:has-text("Play")',
+                'button:has-text("▶")',
+                '.play-button',
+                '[data-testid*="play"]',
+                'input[type="button"][value*="play" i]'
+            ]
+            
+            play_button_found = False
+            for selector in play_button_selectors:
+                try:
+                    logger.info(f"🔍 Trying selector: {selector}")
+                    await self.page.wait_for_selector(selector, timeout=2000)
+                    logger.info(f"✅ Found play button with selector: {selector}")
+                    play_button_found = True
+                    
+                    # Install capture hooks right before clicking
+                    logger.info("🔗 Installing capture hooks right before play button click...")
+                    await self._setup_slide_capture_hooks()
+                    
+                    # Enable CDP screencast for non-canvas presentations
+                    logger.info("📹 Setting up CDP screencast for non-canvas presentation...")
+                    session = await self.page.context.new_cdp_session(self.page)
+                    await session.send("Page.startScreencast", {
+                        "format": "png",
+                        "quality": 90,
+                        "everyNthFrame": 1  # Capture every frame, no throttling
+                    })
+                    logger.info("✅ CDP screencast enabled - will capture presentation frames")
+                    
+                    # Click the play button using JavaScript for reliability
+                    logger.info("🎯 Clicking play button with JavaScript...")
+                    await self.page.evaluate(f"""
+                        () => {{
+                            const button = document.querySelector('{selector}');
+                            if (button) {{
+                                button.click();
+                                console.log('✅ Play button clicked via JavaScript');
+                                return true;
+                            }}
+                            return false;
+                        }}
+                    """)
+                    
+                    logger.info("✅ Play button clicked with JavaScript!")
+                    break
+                    
+                except Exception as e:
+                    logger.debug(f"Selector {selector} failed: {e}")
+                    continue
+            
+            if not play_button_found:
+                logger.error("❌ No play button found")
+                raise Exception("No play button found")
+            
+            # Wait for slide capture to activate
+            logger.info("⏱️ Waiting for slide's useDomCapture to activate...")
+            await asyncio.sleep(0.5)
+            
+            # Monitor slide capture directly to queue (with CDP support)
+            await self._handle_slide_capture_monitoring_to_queue_with_cdp(duration, frame_queue)
+            
+        except Exception as e:
+            logger.error(f"❌ Automated play and slide capture to queue failed: {e}")
             raise
 
     async def _automated_play_and_slide_capture_to_dir(self, duration: int, target_directory: str):
@@ -525,6 +616,140 @@ class BrowserAutomationService:
             
         except Exception as e:
             logger.error(f"❌ Slide capture monitoring failed: {e}")
+            raise
+
+    async def _handle_slide_capture_monitoring_to_queue_with_cdp(self, duration: int, frame_queue: "asyncio.Queue"):
+        """Monitor slide capture and feed frames directly to queue with CDP screencast fallback"""
+        try:
+            logger.info("🎬 Starting slide capture monitoring (direct to queue)...")
+            
+            total_saved = 0
+            start_time = time.time()
+            cdp_session = None
+            
+            # Get CDP session for screencast
+            try:
+                cdp_session = await self.page.context.new_cdp_session(self.page)
+                logger.info("📹 CDP session established for frame capture")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not establish CDP session: {e}")
+            
+            # Monitor for frames
+            while time.time() - start_time < duration:
+                try:
+                    frames_captured_this_cycle = 0
+                    
+                    # First try canvas buffer (if presentation uses canvas)
+                    buffer_status = await self.page.evaluate("""
+                        () => {
+                            return {
+                                bufferSize: window.bufferSize || 0,
+                                isComplete: window.slideCaptureComplete || false
+                            };
+                        }
+                    """)
+                    
+                    buffer_size = buffer_status.get('bufferSize', 0)
+                    
+                    if buffer_size > total_saved:
+                        # Process canvas frames
+                        frames_to_process = min(buffer_size - total_saved, 8)
+                        
+                        for frame_idx in range(total_saved, min(total_saved + frames_to_process, buffer_size)):
+                            try:
+                                frame_data = await self.page.evaluate(f"""
+                                    () => {{
+                                        if (window.frameBuffer && window.frameBuffer[{frame_idx}]) {{
+                                            return window.frameBuffer[{frame_idx}];
+                                        }}
+                                        return null;
+                                    }}
+                                """)
+                                
+                                if frame_data and isinstance(frame_data, str) and frame_data.startswith('data:image/png;base64,'):
+                                    # Convert base64 to PIL Image and feed to queue
+                                    import base64
+                                    from PIL import Image
+                                    import io
+                                    
+                                    image_data = base64.b64decode(frame_data.split(',')[1])
+                                    frame_image = Image.open(io.BytesIO(image_data)).resize((854, 480))
+                                    
+                                    # Put frame in queue (non-blocking)
+                                    try:
+                                        frame_queue.put_nowait((total_saved, frame_image))
+                                        total_saved += 1
+                                        frames_captured_this_cycle += 1
+                                    except Exception as queue_error:
+                                        # If queue is full, remove oldest and add new
+                                        try:
+                                            frame_queue.get_nowait()  # Remove oldest
+                                            frame_queue.put_nowait((total_saved, frame_image))
+                                            total_saved += 1
+                                            frames_captured_this_cycle += 1
+                                        except Exception:
+                                            logger.debug(f"Queue operation failed: {queue_error}")
+                                    
+                            except Exception as e:
+                                logger.debug(f"Canvas frame {frame_idx} processing failed: {e}")
+                                continue
+                    
+                    # If no canvas frames, try CDP screencast
+                    if frames_captured_this_cycle == 0 and cdp_session:
+                        try:
+                            # Request screencast frame
+                            result = await cdp_session.send("Page.captureScreenshot", {
+                                "format": "png",
+                                "quality": 90
+                            })
+                            
+                            if result and 'data' in result:
+                                # Convert base64 to PIL Image and feed to queue
+                                import base64
+                                from PIL import Image
+                                import io
+                                
+                                image_data = base64.b64decode(result['data'])
+                                frame_image = Image.open(io.BytesIO(image_data)).resize((854, 480))
+                                
+                                # Put frame in queue (non-blocking)
+                                try:
+                                    frame_queue.put_nowait((total_saved, frame_image))
+                                    total_saved += 1
+                                    frames_captured_this_cycle += 1
+                                except Exception as queue_error:
+                                    # If queue is full, remove oldest and add new
+                                    try:
+                                        frame_queue.get_nowait()  # Remove oldest
+                                        frame_queue.put_nowait((total_saved, frame_image))
+                                        total_saved += 1
+                                        frames_captured_this_cycle += 1
+                                    except Exception:
+                                        logger.debug(f"Queue operation failed: {queue_error}")
+                                
+                        except Exception as e:
+                            logger.debug(f"CDP screenshot failed: {e}")
+                    
+                    # Log progress
+                    if total_saved % 25 == 0 and frames_captured_this_cycle > 0:
+                        elapsed = time.time() - start_time
+                        fps = total_saved / elapsed if elapsed > 0 else 0
+                        queue_size = frame_queue.qsize()
+                        logger.info(f"📸 Fed {total_saved} frames to queue in {elapsed:.1f}s ({fps:.1f} FPS, queue size: {queue_size})")
+                    
+                    # Sleep for next cycle
+                    await asyncio.sleep(0.04)  # 25 FPS timing
+                    
+                except Exception as e:
+                    logger.debug(f"Error in monitoring loop: {e}")
+                    await asyncio.sleep(0.1)
+                    continue
+            
+            queue_size = frame_queue.qsize()
+            logger.info(f"✅ Slide capture monitoring completed: {total_saved} frames fed to queue (final queue size: {queue_size})")
+            
+        except Exception as e:
+            logger.error(f"❌ Slide capture monitoring to queue failed: {e}")
             raise
 
     async def _handle_slide_capture_monitoring_to_dir_old(self, duration: int, target_directory: str):

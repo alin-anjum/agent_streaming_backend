@@ -848,10 +848,8 @@ class RapidoMainSystem:
             self.continuous_frame_delivery(frame_processor)
         )
         
-        # Start slide frame producer for dynamic capture - EXACT SYNCTALK PATTERN
-        if self.use_dynamic_capture:
-            logger.info("🎬 Starting slide frame producer (background)...")
-            self._slide_producer_task = asyncio.create_task(self._produce_slide_frames())
+        # Note: For dynamic capture, frames are now fed directly to queue by browser service
+        # No separate slide frame producer task needed since browser feeds queue directly
         
         # Start real-time streaming
         logger.info("🎭 Starting OPTIMIZED REAL-TIME audio streaming with 160ms chunks...")
@@ -1087,28 +1085,46 @@ class RapidoMainSystem:
                         frame = frame_data["frame"]
                         audio = frame_data["audio"]
                         
-                        # Get slide frame - FAST CACHED ACCESS for dynamic capture
-                        if self.use_dynamic_capture and self.slide_frame_count > 0:
-                            # Use fast cached access - no disk I/O blocking
-                            safe_slide_index = slide_frame_index % self.slide_frame_count
-                            # TODO: change this to use queue system
-                            slide_frame = self.get_cached_slide_frame(safe_slide_index)
-                            self.total_slide_frames = self.slide_frame_count  # Update for progress logging
-                            if slide_frame_index % 25 == 0:  # Debug every second
-                                logger.info(f"🎬 DYNAMIC: Using cached frame {safe_slide_index}/{self.slide_frame_count}")
-                        else:
-                            # Fallback to frame processor for static frames
-                            current_frame_count = frame_processor.get_frame_count()
-                            if current_frame_count > 0:
-                                safe_slide_index = slide_frame_index % current_frame_count
-                                self.total_slide_frames = current_frame_count
-                            else:
-                                safe_slide_index = 0
-                            slide_frame = frame_processor.get_slide_frame(safe_slide_index)
-                            if slide_frame_index % 25 == 0:  # Debug every second
-                                logger.info(f"🎬 STATIC: Using frame processor {safe_slide_index}/{current_frame_count}, dynamic_count={self.slide_frame_count}")
+                        # Get slide frame from slide_frame_queue with same buffer logic as avatar frames
+                        slide_frame = None
+                        slide_frame_available = False
                         
-                        if slide_frame:
+                        if self.slide_frame_queue and not self.slide_frame_queue.empty():
+                            try:
+                                # Get slide frame from queue (non-blocking)
+                                slide_frame_index_from_queue, slide_frame = self.slide_frame_queue.get_nowait()
+                                slide_frame_available = True
+                                self.last_slide_frame = slide_frame  # Save for potential duplication
+                                self.last_slide_frame_index = slide_frame_index_from_queue
+                                
+                                if slide_frame_index % 25 == 0:  # Debug every second
+                                    queue_size = self.slide_frame_queue.qsize()
+                                    logger.info(f"🎬 QUEUE: Using slide frame {slide_frame_index_from_queue} (queue: {queue_size} frames)")
+                                    
+                            except asyncio.QueueEmpty:
+                                slide_frame_available = False
+                        
+                        # If no frame available from queue, use duplication logic like avatar frames
+                        if not slide_frame_available:
+                            if hasattr(self, 'last_slide_frame') and self.last_slide_frame is not None:
+                                # Duplicate last slide frame for smooth playback
+                                slide_frame = self.last_slide_frame.copy()
+                                if slide_frame_index % 25 == 0:  # Debug every second
+                                    queue_size = self.slide_frame_queue.qsize() if self.slide_frame_queue else 0
+                                    logger.info(f"🎬 🔄 SLIDE QUEUE EMPTY - duplicating last slide frame (queue: {queue_size})")
+                            else:
+                                # Fallback to frame processor for initial frames or when no queue available
+                                current_frame_count = frame_processor.get_frame_count()
+                                if current_frame_count > 0:
+                                    safe_slide_index = slide_frame_index % current_frame_count
+                                    self.total_slide_frames = current_frame_count
+                                else:
+                                    safe_slide_index = 0
+                                slide_frame = frame_processor.get_slide_frame(safe_slide_index)
+                                if slide_frame_index % 25 == 0:  # Debug every second
+                                    logger.info(f"🎬 FALLBACK: Using frame processor {safe_slide_index}/{current_frame_count} (no queue frames available)")
+                        
+                        if slide_frame is not None:
                             # FAST COMPOSITION with performance tracking
                             composition_start = time.time()
                             composed_frame = frame_processor.overlay_avatar_on_slide(
@@ -1206,10 +1222,11 @@ class RapidoMainSystem:
                             
                             # Log progress and performance
                             if frame_count % 50 == 0:
-                                cycle_count = slide_frame_index // self.total_slide_frames if self.total_slide_frames > 0 else 0
-                                current_slide = safe_slide_index
-                                cache_indicator = " - CACHED" if self.use_dynamic_capture else ""
-                                logger.info(f"📊 Slide progress: {current_slide}/{self.total_slide_frames} (cycle {cycle_count + 1}, frame {frame_count}){cache_indicator}")
+                                # Show slide frame queue status instead of cache-based progress
+                                slide_queue_size = self.slide_frame_queue.qsize() if self.slide_frame_queue else 0
+                                current_slide_info = f"{getattr(self, 'last_slide_frame_index', 'N/A')}" if hasattr(self, 'last_slide_frame_index') else "N/A"
+                                queue_indicator = " - QUEUE" if slide_frame_available else " - DUPLICATED" if hasattr(self, 'last_slide_frame') else " - FALLBACK"
+                                logger.info(f"📊 Slide progress: Frame {current_slide_info} (queue: {slide_queue_size}, output frame {frame_count}){queue_indicator}")
                             
                             if frame_count % 25 == 0:  # Log every second  
                                 elapsed_time = current_time - self.frame_delivery_start_time
@@ -1217,21 +1234,37 @@ class RapidoMainSystem:
                                 fps_diff = sustained_fps - target_fps
                                 status = "✅" if abs(fps_diff) < 1.0 else "⚠️"
                                 
-                                # New color coding for intake buffer status
+                                # Buffer status for both avatar and slide frames
                                 if intake_size > 30:
-                                    buffer_status = "🟢"  # Plenty of buffer
+                                    avatar_buffer_status = "🟢"  # Plenty of buffer
                                 elif intake_size > 10:
-                                    buffer_status = "🟡"  # Getting low but still safe
+                                    avatar_buffer_status = "🟡"  # Getting low but still safe
                                 elif intake_size > 0:
-                                    buffer_status = "🟠"  # Very low but still have frames
+                                    avatar_buffer_status = "🟠"  # Very low but still have frames
                                 else:
-                                    buffer_status = "🔄"  # Duplicating frames
-                                logger.info(f"🎬 {status} SUSTAINED: {sustained_fps:.1f}/{target_fps} FPS (diff: {fps_diff:+.1f}) {buffer_status} intake: {intake_size} frames")
+                                    avatar_buffer_status = "🔄"  # Duplicating frames
+                                
+                                # Slide frame buffer status
+                                slide_queue_size = self.slide_frame_queue.qsize() if self.slide_frame_queue else 0
+                                if slide_queue_size > 30:
+                                    slide_buffer_status = "🟢"
+                                elif slide_queue_size > 10:
+                                    slide_buffer_status = "🟡"
+                                elif slide_queue_size > 0:
+                                    slide_buffer_status = "🟠"
+                                else:
+                                    slide_buffer_status = "🔄"
+                                
+                                logger.info(f"🎬 {status} SUSTAINED: {sustained_fps:.1f}/{target_fps} FPS (diff: {fps_diff:+.1f}) {avatar_buffer_status} avatar: {intake_size} | {slide_buffer_status} slide: {slide_queue_size}")
                         
-                        # Mark task as done - frame successfully processed and output
-                        # Only mark as done if we actually got a frame from intake (not duplicated)
+                        # Mark tasks as done - frames successfully processed and output
+                        # Only mark as done if we actually got frames from queues (not duplicated)
                         if not is_duplicated_frame:
                             self.intake_queue.task_done()
+                        
+                        # Mark slide frame task as done if we got it from queue
+                        if slide_frame_available and self.slide_frame_queue:
+                            self.slide_frame_queue.task_done()
                         
                 except asyncio.CancelledError:
                     break
@@ -1753,27 +1786,34 @@ class RapidoMainSystem:
         logger.info(f"🌐 Capturing from URL: {self.capture_url}")
         logger.info("⏱️ Capture will end automatically when presentation finishes")
         
+        # Initialize slide frame queue for real-time frame capture
+        if self.slide_frame_queue is None:
+            self.slide_frame_queue = asyncio.Queue(maxsize=200)  # Buffer up to 100 slide frames
+            logger.info("📥 Slide frame queue initialized (maxsize: 100)")
+        
         try:
-            # Start dynamic capture (non-blocking)
-            from tab_capture import capture_presentation_frames, DynamicFrameProcessor
-            self.dynamic_frames_dir = await capture_presentation_frames(
-                capture_url=self.capture_url
+            # Start dynamic capture (direct to queue - no file system)
+            from tab_capture.capture_api import capture_presentation_frames_to_queue
+            success = await capture_presentation_frames_to_queue(
+                capture_url=self.capture_url,
+                frame_queue=self.slide_frame_queue
             )
             
-            if self.dynamic_frames_dir is None:
-                raise Exception("Failed to start dynamic frame capture - no directory returned")
+            if not success:
+                raise Exception("Failed to start dynamic frame capture - could not initialize browser")
                 
             logger.info("✅ Dynamic frame capture started in background")
-            logger.info(f"📁 Frames will be saved to: {self.dynamic_frames_dir}")
+            logger.info("📥 Frames will be fed directly to queue (no file system)")
             
-            # Wait for first few frames to be captured before proceeding
-            logger.info("⏳ Waiting for first slide frames to be captured...")
+            # No need for file watcher since frames are fed directly to queue
+            # The browser service will populate slide_frame_queue directly
+            
+            # Wait for first few frames to be queued before proceeding
+            logger.info("⏳ Waiting for first slide frames to be queued...")
             await self._wait_for_initial_frames()
             
-            # For dynamic capture, we use the cache system instead of frame processor reloading
-            logger.info(f"🔄 Dynamic capture ready - using cache system for: {self.dynamic_frames_dir}")
-            # Keep original frame processor for overlay operations only
-            logger.info(f"📊 Dynamic capture setup completed - cache system active")
+            # For dynamic capture, we use the queue system with direct feeding
+            logger.info("🔄 Dynamic capture ready - using direct queue feeding system")
             
             logger.info("✅ Dynamic frame capture setup completed (non-blocking)")
             
@@ -1782,103 +1822,120 @@ class RapidoMainSystem:
             raise
     
     async def _wait_for_initial_frames(self):
-        """Wait for initial frames to be captured before starting SyncTalk"""
-        frames_dir = Path(self.dynamic_frames_dir)
+        """Wait for initial frames to be populated in slide_frame_queue before starting SyncTalk"""
         min_frames_needed = 3
         max_wait_time = 30  # seconds
         
+        if not self.slide_frame_queue:
+            raise Exception("slide_frame_queue not initialized - cannot wait for frames")
+        
+        logger.info(f"⏳ Waiting for {min_frames_needed} frames to be queued...")
+        
         start_time = time.time()
         while (time.time() - start_time) < max_wait_time:
-            if frames_dir.exists():
-                frame_files = list(frames_dir.glob("frame_*.png"))
-                if len(frame_files) >= min_frames_needed:
-                    logger.info(f"✅ Found {len(frame_files)} slide frames, ready to start SyncTalk!")
-                    logger.info(f"📸 First frames: {[f.name for f in sorted(frame_files)[:3]]}")
-                    return
-                else:
-                    logger.info(f"⏳ Found {len(frame_files)}/{min_frames_needed} frames, waiting for more...")
-            else:
-                logger.info("⏳ Waiting for first slide frame to be captured...")
+            queue_size = self.slide_frame_queue.qsize()
             
+            if queue_size >= min_frames_needed:
+                logger.info(f"✅ Found {queue_size} frames in queue, ready to start SyncTalk!")
+                return
+            
+            elapsed = time.time() - start_time
+            logger.info(f"⏳ Queue has {queue_size}/{min_frames_needed} frames - {elapsed:.1f}s elapsed")
             await asyncio.sleep(1.0)
         
-        raise Exception(f"Timeout waiting for initial frames after {max_wait_time}s")
+        # Timeout - check final count
+        final_queue_size = self.slide_frame_queue.qsize()
+        raise Exception(f"Timeout waiting for initial frames after {max_wait_time}s - only got {final_queue_size}/{min_frames_needed}")
     
-    async def _produce_slide_frames(self):
+    async def _watch_and_queue_frames(self):
         """
-        Producer task that watches dynamic capture directory and loads new frames into queue.
-        Mirrors the exact SyncTalk pattern for non-blocking frame delivery.
+        DEPRECATED: Real-time file watcher that immediately queues frames as they are created in the capture directory.
+        This method is no longer used since we now feed frames directly from browser to queue.
+        Uses polling with minimal delay to catch frames as soon as they're written.
         """
+        logger.warning("⚠️ _watch_and_queue_frames is deprecated - using direct queue feeding instead")
+        return
+        
         if not self.dynamic_frames_dir:
             logger.error("❌ No dynamic frames directory set")
             return
             
-        logger.info(f"🎬 Starting slide frame producer for: {self.dynamic_frames_dir}")
+        logger.info(f"🎬 Starting real-time frame watcher for: {self.dynamic_frames_dir}")
         frames_dir = Path(self.dynamic_frames_dir)
         
         processed_frames = set()  # Track which frames we've already processed
         frame_index_counter = 0  # Sequential counter for proper indexing
+        last_frame_count = 0  # Track directory changes
         
         while self.frame_delivery_running:
             try:
-                # Find all PNG files in the directory
+                # Find all PNG files in the directory with fast detection
                 if frames_dir.exists():
                     frame_files = sorted(list(frames_dir.glob("frame_*.png")))
+                    current_frame_count = len(frame_files)
                     
-                    # Process new frames only
-                    for frame_file in frame_files:
-                        if frame_file.name not in processed_frames:
-                            try:
-                                # Check for duplicate frames by file size (basic deduplication)
-                                file_size = frame_file.stat().st_size
-                                if file_size < 1000:  # Skip very small files (likely corrupted)
-                                    logger.debug(f"⚠️ Skipping small file: {frame_file.name} ({file_size} bytes)")
-                                    processed_frames.add(frame_file.name)  # Mark as processed to avoid retry
-                                    continue
-                                
-                                # Load frame with better error handling
-                                frame_image = Image.open(frame_file).resize((854, 480))
-                                
-                                # Thread-safe cache operations
-                                async with self._cache_lock:
-                                    # Cache the frame with proper sequential index
-                                    self.slide_frames_cache[frame_index_counter] = frame_image
-                                    self.slide_frame_count = frame_index_counter + 1
+                    # Only process if we have new frames (performance optimization)
+                    if current_frame_count > last_frame_count:
+                        # Process only the new frames
+                        for frame_file in frame_files:
+                            if frame_file.name not in processed_frames:
+                                try:
+                                    # Check for duplicate frames by file size (basic deduplication)
+                                    file_size = frame_file.stat().st_size
+                                    if file_size < 1000:  # Skip very small files (likely corrupted)
+                                        logger.debug(f"⚠️ Skipping small file: {frame_file.name} ({file_size} bytes)")
+                                        processed_frames.add(frame_file.name)  # Mark as processed to avoid retry
+                                        continue
                                     
-                                    # Memory management: remove old frames if cache gets too large
-                                    if len(self.slide_frames_cache) > self.max_cached_frames:
-                                        # Remove oldest 100 frames to free memory
-                                        frames_to_remove = 100
-                                        oldest_keys = sorted(self.slide_frames_cache.keys())[:frames_to_remove]
-                                        for old_key in oldest_keys:
-                                            del self.slide_frames_cache[old_key]
-                                        logger.info(f"🧹 Memory cleanup: removed {frames_to_remove} old frames, cache size: {len(self.slide_frames_cache)}")
-                                
-                                # Add to processed set
-                                processed_frames.add(frame_file.name)
-                                frame_index_counter += 1
-                                
-                                # Log progress every 50 frames
-                                if frame_index_counter % 50 == 0:
-                                    logger.info(f"📈 Slide producer: {frame_index_counter} frames cached")
+                                    # Load frame with better error handling
+                                    frame_image = Image.open(frame_file).resize((854, 480))
+
+                                    if frame_image is not None:                                    
+                                        # Put frame in slide_frame_queue instead of cache
+                                        try:
+                                            self.slide_frame_queue.put_nowait((frame_index_counter, frame_image))
+                                            self.slide_frame_count = frame_index_counter + 1
+                                            
+                                        except asyncio.QueueFull:
+                                            # If queue is full, remove oldest frame and add new one
+                                            try:
+                                                self.slide_frame_queue.get_nowait()  # Remove oldest
+                                                self.slide_frame_queue.put_nowait((frame_index_counter, frame_image))
+                                            except asyncio.QueueEmpty:
+                                                pass
+                                        
+                                        # Add to processed set
+                                        processed_frames.add(frame_file.name)
+                                        frame_index_counter += 1
+                                        
+                                        # Log progress every 25 frames
+                                        if frame_index_counter % 25 == 0:
+                                            queue_size = self.slide_frame_queue.qsize()
+                                            logger.info(f"📈 Real-time watcher: {frame_index_counter} frames queued (queue size: {queue_size})")
+                                    else:
+                                        logger.warning(f"⚠️ Could not load frame: {frame_file}")
+                                        processed_frames.add(frame_file.name)
                                     
-                            except Exception as e:
-                                logger.error(f"❌ Error loading slide frame {frame_file}: {e}")
-                                # Mark as processed to avoid infinite retry, but don't increment counter
-                                processed_frames.add(frame_file.name)
-                                # Add retry logic for network/IO issues
-                                if "Permission denied" in str(e) or "being used by another process" in str(e):
-                                    logger.info(f"🔄 Will retry {frame_file.name} in next cycle")
-                                    processed_frames.discard(frame_file.name)  # Allow retry
+                                except Exception as e:
+                                    logger.error(f"❌ Error loading slide frame {frame_file}: {e}")
+                                    # Mark as processed to avoid infinite retry, but don't increment counter
+                                    processed_frames.add(frame_file.name)
+                                    # Add retry logic for network/IO issues
+                                    if "Permission denied" in str(e) or "being used by another process" in str(e):
+                                        logger.info(f"🔄 Will retry {frame_file.name} in next cycle")
+                                        processed_frames.discard(frame_file.name)  # Allow retry
+                        
+                        # Update last frame count after processing
+                        last_frame_count = current_frame_count
                 
-                # Check every 100ms for new frames
-                await asyncio.sleep(0.1)
+                # Fast polling for real-time detection (25ms = 40fps detection rate)
+                await asyncio.sleep(0.025)
                 
             except Exception as e:
                 logger.error(f"❌ Error in slide frame producer: {e}")
                 await asyncio.sleep(1.0)  # Wait longer on error
                 
-        logger.info("🛑 Slide frame producer stopped")
+        logger.info("🛑 Real-time frame watcher stopped")
 
     def get_cached_slide_frame(self, frame_index: int) -> Optional[Image.Image]:
         """Get slide frame from cache - non-blocking like SyncTalk"""
@@ -2203,16 +2260,7 @@ class RapidoMainSystem:
             logger.error(f"❌ Processing failed: {e}")
             raise
         finally:
-            # Clean up slide producer task
-            if hasattr(self, '_slide_producer_task') and self._slide_producer_task:
-                logger.info("🛑 Stopping slide frame producer task...")
-                self._slide_producer_task.cancel()
-                try:
-                    await self._slide_producer_task
-                except asyncio.CancelledError:
-                    logger.info("✅ Slide frame producer task stopped")
-                except Exception as e:
-                    logger.warning(f"⚠️ Error stopping slide producer task: {e}")
+            # Note: No slide producer task cleanup needed since browser service handles frame feeding directly
             
             # Cleanup connections properly
             if hasattr(self, 'audio_processor_task') and self.audio_processor_task:
