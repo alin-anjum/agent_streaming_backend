@@ -134,6 +134,10 @@ class BrowserAutomationService:
             # Wait a moment for any dynamic content to load
             await asyncio.sleep(2)
             
+            # Handle tunnel protection if present
+            logger.info("🔍 Checking for tunnel protection after navigation...")
+            await self._handle_tunnel_protection_button()
+            
             logger.info("🎯 Ready for frame capture")
             return True
             
@@ -286,12 +290,61 @@ class BrowserAutomationService:
             logger.error(f"❌ Failed to install slide capture hooks: {e}")
             raise
 
+    async def _handle_tunnel_protection_button(self):
+        """Handle tunnel/phishing protection button if present"""
+        try:
+            # Look for the specific tunnel protection button
+            tunnel_button_selectors = [
+                'button#continue.tunnel--dwithport-button',
+                'button[id="continue"]',
+                'button.tunnel--dwithport-button',
+                'button:has-text("Continue")',
+                'button[onclick*="setCookie"][onclick*="tunnel_phishing_protection"]'
+            ]
+            
+            tunnel_button_found = False
+            for selector in tunnel_button_selectors:
+                try:
+                    logger.info(f"🔍 Checking for tunnel protection button: {selector}")
+                    # Use a shorter timeout since this is optional
+                    await self.page.wait_for_selector(selector, timeout=3000)
+                    logger.info(f"✅ Found tunnel protection button: {selector}")
+                    tunnel_button_found = True
+                    
+                    # Click the tunnel protection button
+                    logger.info("🛡️ Clicking tunnel protection 'Continue' button...")
+                    await self.page.click(selector)
+                    logger.info("✅ Tunnel protection button clicked successfully")
+                    
+                    # Wait for the page to process the tunnel protection
+                    logger.info("⏱️ Waiting for tunnel protection to process...")
+                    await asyncio.sleep(2)
+                    
+                    break
+                    
+                except Exception as e:
+                    logger.debug(f"Tunnel button selector {selector} failed: {e}")
+                    continue
+            
+            if tunnel_button_found:
+                logger.info("🛡️ Tunnel protection handled successfully")
+            else:
+                logger.info("🔍 No tunnel protection button found - proceeding normally")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Error handling tunnel protection button: {e}")
+            # Don't raise - this is optional functionality
+
     async def _automated_play_and_slide_capture_to_queue(self, duration: int, frame_queue: "asyncio.Queue"):
         """Automated play button click and slide capture monitoring directly to queue"""
         try:
             logger.info("🎬 Starting automated play and slide capture (direct to queue)...")
             
-            # First, look for play button
+            # First, check for tunnel/phishing protection button
+            logger.info("🔍 Checking for tunnel protection button...")
+            await self._handle_tunnel_protection_button()
+            
+            # Then, look for play button
             logger.info("🔍 Looking for play button on the webpage...")
             
             play_button_selectors = [
@@ -368,7 +421,11 @@ class BrowserAutomationService:
         try:
             logger.info("🎬 Starting automated play and slide capture...")
             
-            # First, look for play button
+            # First, check for tunnel/phishing protection button
+            logger.info("🔍 Checking for tunnel protection button...")
+            await self._handle_tunnel_protection_button()
+            
+            # Then, look for play button
             logger.info("🔍 Looking for play button on the webpage...")
             
             play_button_selectors = [
@@ -445,7 +502,11 @@ class BrowserAutomationService:
         try:
             logger.info("🎬 Starting automated play and slide capture...")
             
-            # First, look for play button
+            # First, check for tunnel/phishing protection button
+            logger.info("🔍 Checking for tunnel protection button...")
+            await self._handle_tunnel_protection_button()
+            
+            # Then, look for play button
             logger.info("🔍 Looking for play button on the webpage...")
             
             play_button_selectors = [

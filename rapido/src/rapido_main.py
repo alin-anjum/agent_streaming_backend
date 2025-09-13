@@ -172,6 +172,7 @@ class RapidoMainSystem:
         # Dynamic frame capture configuration
         self.use_dynamic_capture = getattr(self.config, 'USE_DYNAMIC_CAPTURE', False)
         self.capture_url = getattr(self.config, 'CAPTURE_URL', 'https://test.creatium.com/presentation')
+        logger.info(f"🔍 Dynamic capture config: USE_DYNAMIC_CAPTURE={self.use_dynamic_capture}, CAPTURE_URL={self.capture_url}")
 
         # Real-time slide frame streaming (tab-capture) additions - EXACT SYNCTALK PATTERN
         # Mirror the exact SyncTalk pattern: asyncio.Queue with producer task
@@ -537,18 +538,10 @@ class RapidoMainSystem:
                 
         logger.info("🎵 Audio processor loop stopped")
     async def connect_livekit(self):
-        """Connect to LiveKit with optimized settings"""
-        # Check if optimizations are available
-        if OPTIMIZATIONS_AVAILABLE:
-            logger.info("Attempting optimized LiveKit connection...")
-            success = await self._connect_livekit_optimized()
-            if not success:
-                logger.warning("Optimized connection failed, falling back to legacy")
-                return await self._connect_livekit_legacy()
-            return success
-        else:
-            logger.info("Optimizations not available, using legacy connection")
-            return await self._connect_livekit_legacy()
+        """Connect to LiveKit - FORCE LEGACY MODE for stability"""
+        # FORCE LEGACY MODE - Optimized mode was causing InvalidState errors
+        logger.info("🔄 Using LEGACY LiveKit connection for maximum stability")
+        return await self._connect_livekit_legacy()
     
     async def _connect_livekit_optimized(self):
         """Connect to LiveKit with all optimizations enabled"""
@@ -564,16 +557,20 @@ class RapidoMainSystem:
             LIVEKIT_API_KEY = "APImuXsSp8NH5jY"
             LIVEKIT_API_SECRET = "6k9Swe5O6NxeI0WvVTCTrs2k1Ec25byeM4NlnTCKn5GB"
             
+            # Get room name from config
+            room_name = getattr(self.config, 'LIVEKIT_ROOM', 'avatar-room2')
+            logger.info(f"🏠 Optimized LiveKit connecting to room: {room_name}")
+            
             # Generate JWT token
             current_time = int(time.time())
             token_payload = {
                 "iss": LIVEKIT_API_KEY,
-                "sub": f"avatar_bot_{room_name}",  # FIXED: Unique identity per room
+                "sub": f"avatar_bot_{room_name}",
                 "aud": "livekit",
                 "exp": current_time + 3600,
                 "nbf": current_time - 10,
                 "iat": current_time,
-                "jti": f"avatar_bot_{room_name}_{current_time}",  # FIXED: Include room name in JWT ID
+                "jti": f"avatar_bot_{room_name}_{current_time}",
                 "video": {
                     "room": room_name,  # FIXED: Use actual room name from config
                     "roomJoin": True,
@@ -633,16 +630,38 @@ class RapidoMainSystem:
                 """Deliver frame to LiveKit using legacy video source"""
                 if hasattr(self, 'video_source') and self.video_source:
                     try:
-                        # Ensure frame is RGB numpy array
+                        # Ensure frame is proper RGB numpy array with correct memory layout
                         if isinstance(frame, Image.Image):
-                            frame = np.array(frame)
+                            rgb_frame = np.array(frame, dtype=np.uint8)
+                        else:
+                            rgb_frame = np.ascontiguousarray(frame, dtype=np.uint8)
+                        
+                        # Handle RGBA frames (convert to RGB)
+                        if len(rgb_frame.shape) == 3:
+                            if rgb_frame.shape[2] == 4:
+                                # RGBA to RGB conversion - blend with white background
+                                alpha = rgb_frame[:, :, 3:4] / 255.0
+                                rgb_frame = rgb_frame[:, :, :3] * alpha + (1 - alpha) * 255
+                                rgb_frame = rgb_frame.astype(np.uint8)
+                            elif rgb_frame.shape[2] != 3:
+                                logger.error(f"Frame pacer: Invalid frame format: {rgb_frame.shape}")
+                                return
+                        else:
+                            logger.error(f"Frame pacer: Invalid frame format: {rgb_frame.shape}")
+                            return
+                        
+                        height, width, channels = rgb_frame.shape
+                        
+                        # Ensure contiguous memory layout
+                        if not rgb_frame.flags['C_CONTIGUOUS']:
+                            rgb_frame = np.ascontiguousarray(rgb_frame)
                         
                         # Create video frame
                         video_frame = rtc.VideoFrame(
-                            width=frame.shape[1],
-                            height=frame.shape[0],
+                            width=width,
+                            height=height,
                             type=rtc.VideoBufferType.RGB24,
-                            data=frame.tobytes()
+                            data=rgb_frame.tobytes()
                         )
                         
                         # Publish video frame
@@ -710,9 +729,6 @@ class RapidoMainSystem:
             logger.info(f"Frame pacer running: {self.frame_pacer.is_running}")
             logger.info(f"Audio optimizer initialized: {self.audio_optimizer is not None}")
             
-            # Setup data channel for stream control commands
-            await self.setup_stream_control_listener()
-            
             return True
             
         except Exception as e:
@@ -740,12 +756,12 @@ class RapidoMainSystem:
             current_time = int(time.time())
             token_payload = {
                 "iss": LIVEKIT_API_KEY,
-                "sub": f"avatar_bot_{room_name}",  # FIXED: Unique identity per room
+                "sub": "avatar_bot",
                 "aud": "livekit",
                 "exp": current_time + 3600,
                 "nbf": current_time - 10,
                 "iat": current_time,
-                "jti": f"avatar_bot_{room_name}_{current_time}",  # FIXED: Include room name in JWT ID
+                "jti": f"avatar_bot_{current_time}",
                 "video": {
                     "room": room_name,  # FIXED: Use actual room name from config
                     "roomJoin": True,
@@ -774,10 +790,6 @@ class RapidoMainSystem:
             self.audio_publication = await self.lk_room.local_participant.publish_track(audio_track, audio_options)
             
             logger.info("✅ Connected to LiveKit (legacy mode)!")
-            
-            # Setup data channel for stream control commands
-            await self.setup_stream_control_listener()
-            
             return True
             
         except Exception as e:
@@ -893,65 +905,10 @@ class RapidoMainSystem:
         else:
             logger.info(f"✅ Received {self.frames_received}/{expected_total_frames} frames ({(self.frames_received/expected_total_frames*100):.1f}%)")
         
-        # Continue collecting frames without sending end marker
-        # Keep the stream alive and let SyncTalk finish processing all audio
-        logger.info("⏳ Continuing to collect frames from SyncTalk...")
-        
-        # Extended collection period - give SyncTalk much more time
-        extended_collection_timeout = 30.0  # 30 seconds to collect remaining frames
-        collection_start_time = time.time()
-        additional_frames_count = 0
-        frames_at_start = self.frames_received
-        
-        # Keep collecting until we stop receiving frames or timeout
-        consecutive_empty_receives = 0
-        max_consecutive_empty = 5  # Stop after 5 consecutive empty receives (2.5 seconds of no frames)
-        
-        while (time.time() - collection_start_time) < extended_collection_timeout:
-            try:
-                # Try to receive frames with shorter timeout
-                frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.5)
-                if frame and audio:
-                    self.frames_received += 1
-                    additional_frames_count += 1
-                    consecutive_empty_receives = 0  # Reset counter
-                    
-                    # Add to queue for delivery
-                    frame_data = {
-                        "type": "video",
-                        "frame": frame,
-                        "audio": audio,
-                        "timestamp": time.time()
-                    }
-                    try:
-                        self.intake_queue.put_nowait(frame_data)
-                    except asyncio.QueueFull:
-                        # Intake full, remove oldest and add new
-                        try:
-                            self.intake_queue.get_nowait()
-                            self.intake_queue.put_nowait(frame_data)
-                        except:
-                            pass
-                    
-                    # Also collect for fallback
-                    self.avatar_frames.append(frame)
-                    self.avatar_audio_chunks.append(audio)
-                    
-                    # Log progress every 25 frames
-                    if additional_frames_count % 25 == 0:
-                        logger.info(f"📦 Collected {additional_frames_count} additional frames (total: {self.frames_received})")
-                else:
-                    consecutive_empty_receives += 1
-                    if consecutive_empty_receives >= max_consecutive_empty:
-                        logger.info(f"🛑 No frames received for {max_consecutive_empty * 0.5} seconds, assuming stream complete")
-                        break
-            except Exception as e:
-                logger.debug(f"Error receiving frame: {e}")
-                consecutive_empty_receives += 1
-                if consecutive_empty_receives >= max_consecutive_empty:
-                    break
-        
-        logger.info(f"📦 Collected {additional_frames_count} additional frames after TTS complete (total: {self.frames_received})")
+        # Let the frame collector continue collecting frames - no need for redundant collection here
+        # Wait a bit more for frame collection to finish
+        logger.info("⏳ Waiting for frame collector to finish processing remaining frames...")
+        await asyncio.sleep(5.0)  # Give frame collector time to finish
         
         # NOW send end marker after we're really done (via audio processor queue)
         logger.info("📡 Sending end marker to SyncTalk after collecting all frames...")
@@ -1025,14 +982,6 @@ class RapidoMainSystem:
                     buffer_filled = True
                     buffer_wait_time = time.time() - buffer_wait_start
                     logger.info(f"🎬 ✅ Intake buffer filled! {intake_size} frames ready after {buffer_wait_time:.1f}s - starting steady {target_fps}fps output")
-                    
-                    # Send stream started event to frontend
-                    await self.send_stream_event_to_frontend(
-                        "stream_started", 
-                        message="Avatar presentation stream has started",
-                        target_fps=target_fps,
-                        buffer_size=intake_size
-                    )
                     break
                 
                 # Log buffer filling progress every 2 seconds
@@ -1151,11 +1100,6 @@ class RapidoMainSystem:
                             )
                             composition_duration = (time.time() - composition_start) * 1000
                             
-                            # Convert to BGR for video publishing
-                            conversion_start = time.time()
-                            cv_frame = cv2.cvtColor(np.array(composed_frame), cv2.COLOR_RGB2BGR)
-                            conversion_duration = (time.time() - conversion_start) * 1000
-                            
                             # Convert audio for LiveKit
                             pcm_audio = audio if isinstance(audio, bytes) else (audio * 32767).astype('int16').tobytes()
                             
@@ -1163,11 +1107,10 @@ class RapidoMainSystem:
                             max_composition_ms = self.buffer_config['max_composition_time_ms']
                             if composition_duration > max_composition_ms:
                                 logger.warning(f"🐌 Slow composition: {composition_duration:.1f}ms (target: <{max_composition_ms}ms)")
-                            if conversion_duration > 10:
-                                logger.warning(f"🐌 Slow BGR conversion: {conversion_duration:.1f}ms")
                             
                             # Publish to LiveKit at precise timing with performance measurement
                             publish_start = time.time()
+                            cv_frame = cv2.cvtColor(np.array(composed_frame), cv2.COLOR_RGB2BGR)
                             await self.publish_frame_to_livekit(cv_frame, pcm_audio)
                             publish_duration = (time.time() - publish_start) * 1000  # Convert to milliseconds
                             
@@ -1292,116 +1235,6 @@ class RapidoMainSystem:
         
         logger.info("🎬 Buffered frame delivery stopped")
     
-    async def setup_stream_control_listener(self):
-        """Setup data channel listener for stream control commands from frontend"""
-        try:
-            if not hasattr(self, 'lk_room') or not self.lk_room:
-                logger.warning("⚠️ Cannot setup data channel - LiveKit room not available")
-                return
-            
-            @self.lk_room.on("data_received")
-            def handle_control_command(data_packet):
-                try:
-                    import json
-                    # Decode the TextEncoder().encode() format from frontend
-                    command_data = json.loads(data_packet.data.decode('utf-8'))
-                    user_identity = data_packet.participant.identity
-                    
-                    # Extract fields from frontend format
-                    message_id = command_data.get("id", "unknown")
-                    message = command_data.get("message", "").lower().strip()
-                    timestamp = command_data.get("timestamp", 0)
-                    
-                    logger.info(f"📨 Control command from {user_identity}: '{message}' (id: {message_id}, timestamp: {timestamp})")
-                    
-                    # Handle STOP command
-                    if message == "stop":
-                        logger.info("🛑 STOP command received - terminating avatar stream immediately")
-                        logger.info(f"🔍 Command details: ID={message_id}, from={user_identity}")
-                        asyncio.create_task(self.terminate_stream_immediately())
-                    else:
-                        logger.info(f"🔍 Unknown command: '{message}' - ignoring (ID: {message_id})")
-                        
-                except Exception as e:
-                    logger.error(f"Error processing control command: {e}")
-                    logger.error(f"Raw data: {data_packet.data}")
-                    try:
-                        logger.error(f"Decoded data: {data_packet.data.decode('utf-8', errors='replace')}")
-                    except:
-                        pass
-            
-            logger.info("📡 Stream control listener setup complete - ready for 'stop' commands")
-            
-        except Exception as e:
-            logger.error(f"Failed to setup stream control listener: {e}")
-    
-    async def terminate_stream_immediately(self):
-        """Immediately terminate the avatar stream when stop command received"""
-        try:
-            logger.info("🛑 Terminating avatar stream immediately...")
-            
-            # Send stream stopped event to frontend first
-            await self.send_stream_event_to_frontend(
-                "stream_stopped",
-                message="Avatar presentation stopped by user command"
-            )
-            
-            # Stop all streaming processes
-            self.frame_delivery_running = False
-            self.tts_streaming_complete = True
-            
-            # Stop audio processor if running
-            if hasattr(self, 'audio_processor_task') and self.audio_processor_task:
-                self.audio_processor_task.cancel()
-                logger.info("🛑 Audio processor stopped")
-            
-            # Stop frame collector if running  
-            if hasattr(self, 'frame_collector_task') and self.frame_collector_task:
-                self.frame_collector_task.cancel()
-                logger.info("🛑 Frame collector stopped")
-            
-            # Close SyncTalk connection
-            if self.websocket:
-                await self.websocket.close()
-                logger.info("🛑 SyncTalk connection closed")
-            
-            # Close aiohttp session
-            if hasattr(self, 'aiohttp_session') and self.aiohttp_session:
-                await self.aiohttp_session.close()
-                logger.info("🛑 aiohttp session closed")
-            
-            logger.info("✅ Avatar stream terminated successfully by user command")
-            
-        except Exception as e:
-            logger.error(f"Error during stream termination: {e}")
-    
-    async def send_stream_event_to_frontend(self, event_type: str, **event_data):
-        """Send stream events to frontend via LiveKit data channel"""
-        try:
-            if not hasattr(self, 'lk_room') or not self.lk_room:
-                logger.warning("⚠️ Cannot send event - LiveKit room not available")
-                return
-            
-            # Create event in same format as frontend expects
-            event_message = {
-                "id": f"avatar_event_{int(time.time() * 1000)}",
-                "event": event_type,
-                "timestamp": int(time.time() * 1000),
-                **event_data
-            }
-            
-            # Encode same way as frontend  
-            import json
-            data = json.dumps(event_message).encode('utf-8')
-            
-            # Send to all participants via data channel on "control" topic (same as frontend listens)
-            await self.lk_room.local_participant.publish_data(data, topic="control")
-            
-            logger.info(f"📤 Sent event to frontend: {event_type} (id: {event_message['id']})")
-            
-        except Exception as e:
-            logger.error(f"Failed to send stream event: {e}")
-    
     async def _frame_collector_loop(self):
         """Independent frame collector - runs continuously without blocking audio"""
         logger.info("🎬 Frame collector started - collecting frames independently from audio")
@@ -1412,16 +1245,12 @@ class RapidoMainSystem:
         while self.frame_delivery_running:
             try:
                 # Collect frames as fast as SyncTalk produces them
-                frame, audio = await self.receive_avatar_frame_with_audio(timeout=1.0)  # Increased timeout
+                frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.1)
                 
                 if frame and audio:
                     # Track received frames for monitoring
                     self.frames_received += 1
                     frame_collection_count += 1
-                    
-                    # Log first frame received
-                    if frame_collection_count == 1:
-                        logger.info(f"🎉 First frame received from SyncTalk! Frame collection working.")
                     
                     # MONITOR SYNCTALK PRODUCTION RATE
                     self.synctalk_frame_count += 1
@@ -1467,9 +1296,7 @@ class RapidoMainSystem:
                     self.avatar_audio_chunks.append(audio)
                     
             except asyncio.TimeoutError:
-                # No frames available right now - log and continue collecting
-                if frame_collection_count == 0:  # Only log if we haven't received any frames yet
-                    logger.warning(f"🔍 Frame collection timeout - no frames from SyncTalk yet")
+                # No frames available right now - continue collecting
                 continue
             except Exception as e:
                 logger.error(f"Error in frame collector: {e}")
@@ -1511,32 +1338,11 @@ class RapidoMainSystem:
         
         logger.info(f"📦 Current buffer config: {self.buffer_config}")
     
-    async def publish_frame_to_livekit(self, bgr_frame, audio_chunk):
-        """Publish frame and audio to LiveKit with properly configured optimizations"""
-        # Check if optimizations are available and properly configured
-        use_optimized = (OPTIMIZATIONS_AVAILABLE and 
-                        hasattr(self, 'frame_pacer') and self.frame_pacer and
-                        hasattr(self, 'audio_optimizer') and self.audio_optimizer)
-        
-        if use_optimized:
-            # Convert BGR to RGB for optimized path with FIXED frame pacer
-            rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-            return await self.publish_frame_to_livekit_optimized(rgb_frame, audio_chunk)
-        else:
-            # Log once why we're using legacy mode
-            if not hasattr(self, '_logged_legacy_mode'):
-                self._logged_legacy_mode = True
-                reasons = []
-                if not OPTIMIZATIONS_AVAILABLE:
-                    reasons.append("optimizations not available")
-                if not hasattr(self, 'frame_pacer') or not self.frame_pacer:
-                    reasons.append("frame_pacer not initialized")
-                if not hasattr(self, 'audio_optimizer') or not self.audio_optimizer:
-                    reasons.append("audio_optimizer not initialized")
-                logger.info(f"Using legacy LiveKit publishing ({', '.join(reasons)})")
-            
-            # Use legacy publishing
-            return await self._publish_frame_to_livekit_legacy(bgr_frame, audio_chunk)
+    async def publish_frame_to_livekit(self, frame, audio_chunk):
+        """Publish frame and audio to LiveKit - FORCE LEGACY MODE for maximum performance"""
+        # FORCE LEGACY MODE - Disable all optimizations for smooth streaming
+        # The optimized path was causing InvalidState errors and slow performance
+        return await self._publish_frame_to_livekit_legacy(frame, audio_chunk)
     
     async def publish_frame_to_livekit_optimized(self, composed_frame, audio_chunk):
         """Optimized frame and audio publishing with buffering"""
@@ -1589,20 +1395,26 @@ class RapidoMainSystem:
             logger.error(f"Error in optimized publishing: {e}")
     
     async def _publish_frame_to_livekit_legacy(self, bgr_frame, audio_chunk):
-        """Legacy frame and audio publishing"""
+        """Legacy frame and audio publishing - FAST DIRECT MODE"""
         try:
             import livekit.rtc as rtc
             
             if not hasattr(self, 'video_source') or not hasattr(self, 'audio_source'):
                 return
             
-            # Convert BGR to RGB for video frame
-            rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+            # Log once that we're using legacy mode
+            if not hasattr(self, '_legacy_mode_logged'):
+                logger.info("🔄 Using LEGACY LiveKit publishing mode for maximum performance")
+                self._legacy_mode_logged = True
             
-            # Create video frame
+            # Convert BGR to RGB for video frame (simple and fast)
+            rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+            height, width, channels = rgb_frame.shape
+            
+            # Create video frame with explicit dimensions
             video_frame = rtc.VideoFrame(
-                width=rgb_frame.shape[1],
-                height=rgb_frame.shape[0],
+                width=width,
+                height=height,
                 type=rtc.VideoBufferType.RGB24,
                 data=rgb_frame.tobytes()
             )
