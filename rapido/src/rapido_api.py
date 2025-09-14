@@ -379,8 +379,12 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         
         logger.info(f"🚀 Auto-starting presentation for lesson: {lesson_id}, jobId: {video_job_id} in room: {room_name}")
         
-        # Create Rapido system with room override
-        config_override = {'LIVEKIT_ROOM': room_name}
+        # Create Rapido system with room override AND dynamic capture config
+        config_override = {
+            'LIVEKIT_ROOM': room_name,
+            'USE_DYNAMIC_CAPTURE': True,  # Enable dynamic capture like direct execution
+            'CAPTURE_URL': f'https://xgzhc339-5173.inc1.devtunnels.ms/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4'  # Use lesson_id for capture URL
+        }
         rapido = RapidoMainSystem(config_override)
         session_info["rapido_system"] = rapido
         
@@ -390,6 +394,10 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         # Connect to LiveKit
         await rapido.connect_livekit()
         logger.info(f"✅ LiveKit connected for lesson room: {room_name}")
+        
+        # CRITICAL: Setup dynamic frame capture BEFORE connecting to SyncTalk
+        logger.info("🎬 Setting up frame capture...")
+        await rapido.setup_dynamic_frame_capture()
         
         # Update session status
         session_info["status"] = "connecting_synctalk"
@@ -470,7 +478,12 @@ async def start_rapido_session(session_id: str, narration_text: str, avatar_name
     try:
         session["status"] = "initializing"
         
-        # Create and configure Rapido system
+        # Create and configure Rapido system with dynamic capture enabled
+        if 'USE_DYNAMIC_CAPTURE' not in config_override:
+            config_override['USE_DYNAMIC_CAPTURE'] = True
+        if 'CAPTURE_URL' not in config_override:
+            # Use a default capture URL if not provided
+            config_override['CAPTURE_URL'] = 'http://localhost:5173/video-capture/default'
         rapido = RapidoMainSystem(config_override)
         session["rapido_system"] = rapido
         
@@ -478,6 +491,10 @@ async def start_rapido_session(session_id: str, narration_text: str, avatar_name
         session["status"] = "connecting_livekit" 
         await rapido.connect_livekit()
         logger.info(f"✅ LiveKit connected for session: {session_id}")
+        
+        # CRITICAL: Setup dynamic frame capture BEFORE connecting to SyncTalk
+        logger.info("🎬 Setting up frame capture...")
+        await rapido.setup_dynamic_frame_capture()
         
         # Connect to SyncTalk
         session["status"] = "connecting_synctalk"
