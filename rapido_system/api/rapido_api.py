@@ -383,11 +383,13 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         logger.info(f"🚀 Auto-starting presentation for lesson: {lesson_id}, jobId: {video_job_id} in room: {room_name}")
         
         # Create Rapido system with room override AND dynamic capture config
+        # Use the incoming captureUrl and video_job_id so the captured document filename
+        # matches the lookup pattern below.
         config_override = {
             'LIVEKIT_ROOM': room_name,
-            'USE_DYNAMIC_CAPTURE': True,  # Enable dynamic capture like direct execution
-            'CAPTURE_URL': 'https://test.creatium.com/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4',  # Use videoJobId for capture URL
-            'VIDEO_JOB_ID': '81eceadf-2503-4915-a2bf-12eb252329e4'  # Pass video job ID for document capture
+            'USE_DYNAMIC_CAPTURE': True,
+            'CAPTURE_URL': captureUrl,
+            'VIDEO_JOB_ID': video_job_id
         }
         rapido = RapidoMainSystem(config_override)
         session_info["rapido_system"] = rapido

@@ -128,6 +128,9 @@ class RapidoMainSystem:
         self.websocket = None
         self.aiohttp_session = None
         self.audio_send_queue = None
+        self.end_of_stream_sent = False  # Prevent any audio sends after EOS
+        self._video_writer = None        # OpenCV VideoWriter for final MP4
+        self._video_output_path = None   # Path to saved video
         self.avatar_frames = []
         self.avatar_audio_chunks = []
         # Get the script directory and resolve paths relative to the project root
@@ -249,10 +252,10 @@ class RapidoMainSystem:
         # Initialize buffering strategy configuration  
         # REALITY-BASED: SyncTalk produces ~23.1 FPS, Frame pacer delivers ~17.7 FPS
         self.buffer_config = {
-            'min_buffer_threshold': 75,    # Smaller buffer - faster startup
+            'min_buffer_threshold': 10,    # Smaller buffer - much faster startup
             'min_buffer_level': 5,         # Very low threshold - we'll duplicate frames instead of pausing
             'refill_target': 10,           # Not used - we don't refill during playback
-            'target_fps': 23.0,            # REALISTIC: Match SyncTalk's actual output (not 25!)
+            'target_fps': 25.0,            # Target 25 FPS output
             'max_timing_drift': 0.08,      # Max timing drift before reset (2 frame intervals)
             'duplicate_when_empty': True,  # Duplicate last frame instead of pausing - SMOOTH PLAYBACK!
             'max_composition_time_ms': 30, # Max acceptable composition time
@@ -262,7 +265,7 @@ class RapidoMainSystem:
         
         logger.info(f"📊 Rapido initialized - Duration: {self.total_duration_seconds:.2f}s")
         logger.info(f"📦 Buffer config: threshold={self.buffer_config['min_buffer_threshold']}, level={self.buffer_config['min_buffer_level']}, fps={self.buffer_config['target_fps']}")
-        logger.info(f"🎯 REALITY-BASED optimization: SyncTalk ~23 FPS, Frame pacer properly configured for 23 FPS")
+        logger.info(f"🎯 Output target set to {self.buffer_config['target_fps']} FPS (duplication on underrun enabled)")
     
     def __del__(self):
         """Cleanup thread pool on destruction"""
@@ -476,6 +479,9 @@ class RapidoMainSystem:
     
     async def send_audio_chunk(self, audio_data: bytes):
         """Queue audio for non-blocking send to SyncTalk"""
+        if self.end_of_stream_sent:
+            logger.debug("🔇 Ignoring audio chunk after EOS")
+            return
         if self.audio_send_queue:
             try:
                 # Queue audio for sending - with better error handling
@@ -812,9 +818,9 @@ class RapidoMainSystem:
         logger.info("🚀 Starting OPTIMIZED REAL-TIME ElevenLabs TTS streaming")
         tts_client = ElevenLabsTTSClient(api_key=api_key)
         
-        # Single queue buffering system optimized for 23fps reality
-        # Fast collection from SyncTalk, realistic timing control for output
-        self.intake_queue = asyncio.Queue(maxsize=200)  # Optimized buffer size for 23fps
+        # Avatar frame intake queue - allow large backlog since SyncTalk can burst >50 FPS
+        # This prevents fast-forwarding when output is paced at 25 FPS.
+        self.intake_queue = asyncio.Queue(maxsize=5000)
         self.buffer_lock = asyncio.Lock()
         self.last_frame_data = None  # Keep last frame for duplication when buffer empty
         
@@ -887,56 +893,52 @@ class RapidoMainSystem:
         # Mark TTS streaming as complete
         self.tts_streaming_complete = True
         logger.info(f"🎭 TTS streaming complete. Sent {self.audio_chunks_sent} audio chunks to SyncTalk")
-        
-        # Send end marker immediately when TTS completes - SyncTalk needs this to know no more audio is coming
-        logger.info("📡 Sending end marker to SyncTalk - TTS complete, no more audio chunks coming...")
+
+        # Immediately signal end-of-stream to SyncTalk so it can stop generating new frames
+        # and flush remaining frames naturally.
+        logger.info("📡 Sending end marker to SyncTalk immediately after TTS completion...")
         try:
+            self.end_of_stream_sent = True
             await self.audio_send_queue.put({"type": "end_stream"})
-            logger.info("✅ End marker sent - SyncTalk now knows TTS is complete")
+            logger.info("✅ End marker queued for audio processor")
         except Exception as e:
             logger.warning(f"Failed to queue end marker: {e}")
-        
-        # Now wait for SyncTalk to finish processing all audio chunks and generating final frames
-        # We'll let the frame collector continue running to collect the remaining frames
-        estimated_narration_seconds = (self.audio_chunks_sent * 0.16)  # 160ms per chunk
-        processing_wait_time = max(10.0, estimated_narration_seconds * 0.5)  # At least 10s, or 50% of narration length
-        logger.info(f"⏳ Waiting {processing_wait_time:.1f}s for SyncTalk to finish processing {self.audio_chunks_sent} audio chunks...")
 
-        # Monitor frame collection while waiting
-        frames_at_start = len(self.avatar_frames)
-        wait_start_time = time.time()
-        elapsed_logged = 0
-        while (time.time() - wait_start_time) < processing_wait_time:
-            await asyncio.sleep(1.0)
-            elapsed_logged += 1
-            if elapsed_logged % 5 == 0:  # Log every 5 seconds
-                current_frames = len(self.avatar_frames)
-                logger.info(
-                    f"📊 Frame collection progress: {current_frames} frames collected "
-                    f"({current_frames - frames_at_start} new in {elapsed_logged}s)"
-                )
-
-        # After base wait, continue until frame collection stabilizes (no new frames for 3 consecutive seconds)
-        stable_count = 0
-        last_frame_count = len(self.avatar_frames)
-        stabilization_start = time.time()
-        max_stabilize_time = 20.0  # safety cap
-        logger.info("⏳ Waiting for frame collection to stabilize (no new frames for 3s)...")
-        while stable_count < 3 and (time.time() - stabilization_start) < max_stabilize_time:
-            await asyncio.sleep(1.0)
-            current_frame_count = len(self.avatar_frames)
-            if current_frame_count > last_frame_count:
-                stable_count = 0
-                logger.info(f"📈 New frames arrived: {current_frame_count} total")
+        # Drain remaining frames until:
+        # 1) No new frames arrive for a short quiet period AND
+        # 2) The intake queue is empty for a short continuous period.
+        # No timeout: fully flush all frames after audio ends.
+        quiet_required_seconds = 1.0
+        empty_required_seconds = 1.0
+        last_received_count = self.frames_received
+        quiet_elapsed = 0.0
+        empty_elapsed = 0.0
+        logger.info("⏳ Draining remaining frames until queue empty and quiet period (no timeout)...")
+        while True:
+            await asyncio.sleep(0.5)
+            # Check quiet period on incoming frames
+            current_received = self.frames_received
+            if current_received == last_received_count:
+                quiet_elapsed += 0.5
             else:
-                stable_count += 1
-            last_frame_count = current_frame_count
-
-        final_frame_count = len(self.avatar_frames)
-        logger.info(
-            f"🎬 Final frame collection: {final_frame_count} total frames "
-            f"({final_frame_count - frames_at_start} collected during post-TTS wait)"
-        )
+                quiet_elapsed = 0.0
+                last_received_count = current_received
+            # Check output queue emptiness
+            qsize = self.intake_queue.qsize()
+            if qsize == 0:
+                empty_elapsed += 0.5
+            else:
+                empty_elapsed = 0.0
+            # Periodic status
+            if int(time.time()) % 5 == 0:
+                logger.info(f"🧺 Drain status: queue={qsize}, quiet={quiet_elapsed:.1f}s, empty={empty_elapsed:.1f}s, received={current_received}")
+            # Exit when both conditions satisfied
+            if quiet_elapsed >= quiet_required_seconds and empty_elapsed >= empty_required_seconds:
+                logger.info(
+                    f"✅ Drain complete: queue empty ({empty_elapsed:.1f}s) and quiet ({quiet_elapsed:.1f}s). "
+                    f"Total frames received: {current_received}"
+                )
+                break
         
         # Now stop frame delivery gracefully
         logger.info("🛑 Stopping frame delivery system...")
@@ -965,10 +967,42 @@ class RapidoMainSystem:
             except asyncio.CancelledError:
                 logger.info(f"✅ {task_name} task cancelled successfully")
         
-        # Close aiohttp session
+        # Close video writer if open and summarize
+        if self._video_writer is not None:
+            try:
+                self._video_writer.release()
+                logger.info(f"🎬 Final video saved: {self._video_output_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to finalize video writer: {e}")
+            self._video_writer = None
+
+        # Cleanup dynamic capture browser if running
+        try:
+            if hasattr(self, '_browser_service') and self._browser_service is not None:
+                await self._browser_service.cleanup()
+                logger.info("🧹 Dynamic capture browser cleaned up")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to cleanup dynamic capture browser: {e}")
+        
+        # Close SyncTalk websocket then aiohttp session
+        if self.websocket:
+            try:
+                await self.websocket.close()
+                logger.info("✅ SyncTalk websocket closed")
+            except Exception as e:
+                logger.warning(f"⚠️ Websocket close failed: {e}")
+            self.websocket = None
         if self.aiohttp_session:
             await self.aiohttp_session.close()
             logger.info("✅ aiohttp session closed")
+
+        # Disconnect LiveKit room if connected
+        try:
+            if hasattr(self, 'lk_room') and self.lk_room:
+                await self.lk_room.disconnect()
+                logger.info("✅ LiveKit room disconnected")
+        except Exception as e:
+            logger.warning(f"⚠️ LiveKit disconnect failed: {e}")
         
         return True
     
@@ -998,7 +1032,9 @@ class RapidoMainSystem:
             while self.frame_delivery_running and not buffer_filled:
                 intake_size = self.intake_queue.qsize()
                 
-                if intake_size >= min_buffer_threshold:
+                # Ensure threshold is not higher than the queue size
+                effective_threshold = min(min_buffer_threshold, self.intake_queue.maxsize)
+                if intake_size >= effective_threshold:
                     buffer_filled = True
                     buffer_wait_time = time.time() - buffer_wait_start
                     logger.info(f"🎬 ✅ Intake buffer filled! {intake_size} frames ready after {buffer_wait_time:.1f}s - starting steady {target_fps}fps output")
@@ -1008,7 +1044,10 @@ class RapidoMainSystem:
                 if int(time.time() - buffer_wait_start) % 2 == 0:
                     elapsed = time.time() - buffer_wait_start
                     if elapsed > 1:  # Only log after first second
-                        logger.info(f"🎬 📦 Intake buffer: {intake_size}/{min_buffer_threshold} frames ({elapsed:.1f}s elapsed)")
+                        logger.info(
+                            f"🎬 📦 Intake buffer: {intake_size}/{effective_threshold} frames "
+                            f"(queue max: {self.intake_queue.maxsize}, {elapsed:.1f}s elapsed)"
+                        )
                 
                 # Wait a bit before checking again
                 await asyncio.sleep(0.5)
@@ -1131,6 +1170,28 @@ class RapidoMainSystem:
                             # Publish to LiveKit at precise timing with performance measurement
                             publish_start = time.time()
                             cv_frame = cv2.cvtColor(np.array(composed_frame), cv2.COLOR_RGB2BGR)
+                            # Initialize video writer on first frame
+                            if self._video_writer is None:
+                                try:
+                                    os.makedirs(self.output_dir, exist_ok=True)
+                                except Exception:
+                                    pass
+                                ts = int(time.time())
+                                self._video_output_path = os.path.join(self.output_dir, f"rapido_stream_{ts}.mp4")
+                                height_v, width_v = cv_frame.shape[:2]
+                                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                                self._video_writer = cv2.VideoWriter(self._video_output_path, fourcc, target_fps, (width_v, height_v))
+                                if self._video_writer and self._video_writer.isOpened():
+                                    logger.info(f"🎬 Video writer opened: {self._video_output_path} @ {target_fps}fps, {width_v}x{height_v}")
+                                else:
+                                    logger.warning("⚠️ Failed to open video writer - final MP4 will not be saved")
+
+                            # Write frame to MP4 if writer is available
+                            try:
+                                if self._video_writer and self._video_writer.isOpened():
+                                    self._video_writer.write(cv_frame)
+                            except Exception as e:
+                                logger.warning(f"⚠️ Video write failed: {e}")
                             await self.publish_frame_to_livekit(cv_frame, pcm_audio)
                             publish_duration = (time.time() - publish_start) * 1000  # Convert to milliseconds
                             
@@ -1265,8 +1326,7 @@ class RapidoMainSystem:
         while self.frame_delivery_running:
             try:
                 # Collect frames as fast as SyncTalk produces them
-                # Increased timeout to handle brief gaps in frame production
-                frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.5)
+                frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.1)
                 
                 if frame and audio:
                     # Track received frames for monitoring
@@ -1758,13 +1818,13 @@ class RapidoMainSystem:
         try:
             # Start dynamic capture (direct to queue - no file system)
             from tab_capture.capture_api import capture_presentation_frames_to_queue
-            success = await capture_presentation_frames_to_queue(
+            browser_service = await capture_presentation_frames_to_queue(
                 capture_url=self.capture_url,
                 frame_queue=self.slide_frame_queue,
                 video_job_id=self.video_job_id
             )
             
-            if not success:
+            if not browser_service:
                 raise Exception("Failed to start dynamic frame capture - could not initialize browser")
                 
             logger.info("✅ Dynamic frame capture started in background")
@@ -1781,6 +1841,8 @@ class RapidoMainSystem:
             logger.info("🔄 Dynamic capture ready - using direct queue feeding system")
             
             logger.info("✅ Dynamic frame capture setup completed (non-blocking)")
+            # Keep reference for cleanup at shutdown
+            self._browser_service = browser_service
             
         except Exception as e:
             logger.error(f"❌ Dynamic frame capture setup failed: {e}")
@@ -1788,8 +1850,8 @@ class RapidoMainSystem:
     
     async def _wait_for_initial_frames(self):
         """Wait for initial frames to be populated in slide_frame_queue before starting SyncTalk"""
-        min_frames_needed = 3
-        max_wait_time = 30  # seconds
+        min_frames_needed = 1
+        max_wait_time = 8  # seconds
         
         if not self.slide_frame_queue:
             raise Exception("slide_frame_queue not initialized - cannot wait for frames")
@@ -2063,16 +2125,6 @@ class RapidoMainSystem:
             logger.info(f"🎵 Collected {len(self.avatar_audio_chunks)} audio chunks!")
             
             if not self.avatar_frames:
-                # Provide detailed diagnostics before failing
-                logger.error("❌ No avatar frames received - cannot create final video")
-                try:
-                    intake_size = self.intake_queue.qsize() if hasattr(self, 'intake_queue') else -1
-                    logger.error(f"📦 Intake queue size: {intake_size}")
-                except Exception:
-                    pass
-                logger.error(f"🔌 Websocket connected: {self.websocket is not None}")
-                logger.error(f"🎙️ Audio chunks sent: {getattr(self, 'audio_chunks_sent', 'N/A')}")
-                logger.error(f"🧮 Frames received counter: {getattr(self, 'frames_received', 'N/A')}")
                 raise Exception("No avatar frames received")
             
             # Step 5: Frame composition - use pre-loaded frame processor
@@ -2143,13 +2195,7 @@ class RapidoMainSystem:
             logger.info("🎬 Creating final video with H.264...")
             
             if video_frames:
-                # Ensure output directory exists
-                try:
-                    os.makedirs(self.output_dir, exist_ok=True)
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not ensure output directory {self.output_dir}: {e}")
                 output_video = os.path.join(self.output_dir, "rapido_output.mp4")
-                logger.info(f"📁 Output path: {output_video}")
                 
                 # Hardware-accelerated video encoding with proper codec detection
                 fps = self.target_video_fps
@@ -2195,11 +2241,8 @@ class RapidoMainSystem:
                 
                 if not out or not out.isOpened():
                     raise Exception("Failed to initialize any video encoder")
-                logger.info(f"🎞️ Writing {len(video_frames)} frames at {fps} FPS ({width}x{height})")
-                for idx, frame in enumerate(video_frames):
+                for frame in video_frames:
                     out.write(frame)
-                    if idx % (fps * 2) == 0 and idx > 0:  # Log every ~2 seconds of video
-                        logger.info(f"📝 Wrote {idx}/{len(video_frames)} frames ({(idx/len(video_frames))*100:.1f}%)")
                 out.release()
                 
                 # Verify and summarize
