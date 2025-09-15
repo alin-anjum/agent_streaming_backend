@@ -16,9 +16,10 @@ from .frame_processor import DynamicFrameProcessor
 
 logger = logging.getLogger(__name__)
 
-async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: asyncio.Queue, duration_seconds: Optional[int] = None, video_job_id: Optional[str] = None) -> bool:
+async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: asyncio.Queue, duration_seconds: Optional[int] = None, video_job_id: Optional[str] = None):
     """
     Start Playwright capture and feed frames directly to queue (no file system)
+    Returns the BrowserAutomationService instance on success, or None on failure.
     """
     try:
         logger.info(f"🚀 Starting dynamic presentation frame capture (direct to queue)")
@@ -38,13 +39,13 @@ async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: as
         
         if not await browser_service.start():
             logger.error("❌ Failed to start browser service")
-            return False
+            return None
         
         # Navigate and setup capture (includes document capture if video_job_id provided)
         if not await browser_service.navigate_and_setup_capture():
             logger.error("❌ Failed to navigate and setup capture")
             await browser_service.cleanup()
-            return False
+            return None
         
         # Start the long-running capture task in background (non-blocking)
         async def background_capture():
@@ -59,11 +60,11 @@ async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: as
         logger.info(f"✅ Dynamic frame capture started in background!")
         logger.info(f"📥 Frames will be fed directly to queue")
         
-        return True
+        return browser_service
         
     except Exception as e:
         logger.error(f"❌ Dynamic frame capture failed: {e}")
-        return False
+        return None
 
 # Keep the old function for backward compatibility but mark it as deprecated
 async def capture_presentation_frames(capture_url: str, duration_seconds: Optional[int] = None) -> Optional[str]:
