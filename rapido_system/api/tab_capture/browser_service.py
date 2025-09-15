@@ -180,9 +180,9 @@ class BrowserAutomationService:
                 logger.info("✅ Page loaded successfully")
                 await asyncio.sleep(2)
             
-            # Handle tunnel protection if present
-            logger.info("🔍 Checking for tunnel protection after navigation...")
-            await self._handle_tunnel_protection_button()
+            # # Handle tunnel protection if present
+            # logger.info("🔍 Checking for tunnel protection after navigation...")
+            # await self._handle_tunnel_protection_button()
             
             logger.info("🎯 Ready for frame capture")
             return True
@@ -386,9 +386,9 @@ class BrowserAutomationService:
         try:
             logger.info("🎬 Starting automated play and slide capture (direct to queue)...")
             
-            # First, check for tunnel/phishing protection button
-            logger.info("🔍 Checking for tunnel protection button...")
-            await self._handle_tunnel_protection_button()
+            # # First, check for tunnel/phishing protection button
+            # logger.info("🔍 Checking for tunnel protection button...")
+            # await self._handle_tunnel_protection_button()
             
             # Then, look for play button
             logger.info("🔍 Looking for play button on the webpage...")
@@ -467,9 +467,9 @@ class BrowserAutomationService:
         try:
             logger.info("🎬 Starting automated play and slide capture...")
             
-            # First, check for tunnel/phishing protection button
-            logger.info("🔍 Checking for tunnel protection button...")
-            await self._handle_tunnel_protection_button()
+            # # First, check for tunnel/phishing protection button
+            # logger.info("🔍 Checking for tunnel protection button...")
+            # await self._handle_tunnel_protection_button()
             
             # Then, look for play button
             logger.info("🔍 Looking for play button on the webpage...")
@@ -548,9 +548,9 @@ class BrowserAutomationService:
         try:
             logger.info("🎬 Starting automated play and slide capture...")
             
-            # First, check for tunnel/phishing protection button
-            logger.info("🔍 Checking for tunnel protection button...")
-            await self._handle_tunnel_protection_button()
+            # # First, check for tunnel/phishing protection button
+            # logger.info("🔍 Checking for tunnel protection button...")
+            # await self._handle_tunnel_protection_button()
             
             # Then, look for play button
             logger.info("🔍 Looking for play button on the webpage...")
