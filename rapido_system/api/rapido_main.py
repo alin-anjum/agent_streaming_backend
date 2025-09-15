@@ -888,41 +888,55 @@ class RapidoMainSystem:
         self.tts_streaming_complete = True
         logger.info(f"🎭 TTS streaming complete. Sent {self.audio_chunks_sent} audio chunks to SyncTalk")
         
-        # Wait for all frames to be received before sending end marker
-        # We expect approximately 4 frames per 160ms audio chunk
-        expected_total_frames = self.audio_chunks_sent * self.expected_frames_per_chunk
-        logger.info(f"⏳ Waiting for SyncTalk to finish processing... Expecting ~{expected_total_frames} frames from {self.audio_chunks_sent} audio chunks")
-        
-        timeout_start = time.time()
-        max_wait_time = 60.0  # Increased to 60 seconds for longer narrations
-        
-        # Wait for at least 90% of expected frames (allowing for some variance)
-        min_expected_frames = int(expected_total_frames * 0.9)
-        
-        while self.frames_received < min_expected_frames and (time.time() - timeout_start) < max_wait_time:
-            progress_percent = (self.frames_received / expected_total_frames) * 100 if expected_total_frames > 0 else 0
-            logger.info(f"📊 Progress: {self.frames_received}/{expected_total_frames} frames ({progress_percent:.1f}%) - chunks sent: {self.audio_chunks_sent}")
-            await asyncio.sleep(1.0)  # Check every second
-        
-        # Log final status before sending end marker
-        if self.frames_received < min_expected_frames:
-            logger.warning(f"⚠️ Timeout reached! Only received {self.frames_received}/{expected_total_frames} frames ({(self.frames_received/expected_total_frames*100):.1f}%)")
-            logger.warning(f"⚠️ Proceeding to send end marker anyway to avoid hanging...")
-        else:
-            logger.info(f"✅ Received {self.frames_received}/{expected_total_frames} frames ({(self.frames_received/expected_total_frames*100):.1f}%)")
-        
-        # Let the frame collector continue collecting frames - no need for redundant collection here
-        # Wait a bit more for frame collection to finish
-        logger.info("⏳ Waiting for frame collector to finish processing remaining frames...")
-        await asyncio.sleep(5.0)  # Give frame collector time to finish
-        
-        # NOW send end marker after we're really done (via audio processor queue)
-        logger.info("📡 Sending end marker to SyncTalk after collecting all frames...")
+        # Send end marker immediately when TTS completes - SyncTalk needs this to know no more audio is coming
+        logger.info("📡 Sending end marker to SyncTalk - TTS complete, no more audio chunks coming...")
         try:
             await self.audio_send_queue.put({"type": "end_stream"})
-            logger.info("✅ End marker queued for audio processor")
+            logger.info("✅ End marker sent - SyncTalk now knows TTS is complete")
         except Exception as e:
             logger.warning(f"Failed to queue end marker: {e}")
+        
+        # Now wait for SyncTalk to finish processing all audio chunks and generating final frames
+        # We'll let the frame collector continue running to collect the remaining frames
+        estimated_narration_seconds = (self.audio_chunks_sent * 0.16)  # 160ms per chunk
+        processing_wait_time = max(10.0, estimated_narration_seconds * 0.5)  # At least 10s, or 50% of narration length
+        logger.info(f"⏳ Waiting {processing_wait_time:.1f}s for SyncTalk to finish processing {self.audio_chunks_sent} audio chunks...")
+
+        # Monitor frame collection while waiting
+        frames_at_start = len(self.avatar_frames)
+        wait_start_time = time.time()
+        elapsed_logged = 0
+        while (time.time() - wait_start_time) < processing_wait_time:
+            await asyncio.sleep(1.0)
+            elapsed_logged += 1
+            if elapsed_logged % 5 == 0:  # Log every 5 seconds
+                current_frames = len(self.avatar_frames)
+                logger.info(
+                    f"📊 Frame collection progress: {current_frames} frames collected "
+                    f"({current_frames - frames_at_start} new in {elapsed_logged}s)"
+                )
+
+        # After base wait, continue until frame collection stabilizes (no new frames for 3 consecutive seconds)
+        stable_count = 0
+        last_frame_count = len(self.avatar_frames)
+        stabilization_start = time.time()
+        max_stabilize_time = 20.0  # safety cap
+        logger.info("⏳ Waiting for frame collection to stabilize (no new frames for 3s)...")
+        while stable_count < 3 and (time.time() - stabilization_start) < max_stabilize_time:
+            await asyncio.sleep(1.0)
+            current_frame_count = len(self.avatar_frames)
+            if current_frame_count > last_frame_count:
+                stable_count = 0
+                logger.info(f"📈 New frames arrived: {current_frame_count} total")
+            else:
+                stable_count += 1
+            last_frame_count = current_frame_count
+
+        final_frame_count = len(self.avatar_frames)
+        logger.info(
+            f"🎬 Final frame collection: {final_frame_count} total frames "
+            f"({final_frame_count - frames_at_start} collected during post-TTS wait)"
+        )
         
         # Now stop frame delivery gracefully
         logger.info("🛑 Stopping frame delivery system...")
@@ -1251,7 +1265,8 @@ class RapidoMainSystem:
         while self.frame_delivery_running:
             try:
                 # Collect frames as fast as SyncTalk produces them
-                frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.1)
+                # Increased timeout to handle brief gaps in frame production
+                frame, audio = await self.receive_avatar_frame_with_audio(timeout=0.5)
                 
                 if frame and audio:
                     # Track received frames for monitoring
@@ -2048,6 +2063,16 @@ class RapidoMainSystem:
             logger.info(f"🎵 Collected {len(self.avatar_audio_chunks)} audio chunks!")
             
             if not self.avatar_frames:
+                # Provide detailed diagnostics before failing
+                logger.error("❌ No avatar frames received - cannot create final video")
+                try:
+                    intake_size = self.intake_queue.qsize() if hasattr(self, 'intake_queue') else -1
+                    logger.error(f"📦 Intake queue size: {intake_size}")
+                except Exception:
+                    pass
+                logger.error(f"🔌 Websocket connected: {self.websocket is not None}")
+                logger.error(f"🎙️ Audio chunks sent: {getattr(self, 'audio_chunks_sent', 'N/A')}")
+                logger.error(f"🧮 Frames received counter: {getattr(self, 'frames_received', 'N/A')}")
                 raise Exception("No avatar frames received")
             
             # Step 5: Frame composition - use pre-loaded frame processor
@@ -2118,7 +2143,13 @@ class RapidoMainSystem:
             logger.info("🎬 Creating final video with H.264...")
             
             if video_frames:
+                # Ensure output directory exists
+                try:
+                    os.makedirs(self.output_dir, exist_ok=True)
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not ensure output directory {self.output_dir}: {e}")
                 output_video = os.path.join(self.output_dir, "rapido_output.mp4")
+                logger.info(f"📁 Output path: {output_video}")
                 
                 # Hardware-accelerated video encoding with proper codec detection
                 fps = self.target_video_fps
@@ -2164,8 +2195,11 @@ class RapidoMainSystem:
                 
                 if not out or not out.isOpened():
                     raise Exception("Failed to initialize any video encoder")
-                for frame in video_frames:
+                logger.info(f"🎞️ Writing {len(video_frames)} frames at {fps} FPS ({width}x{height})")
+                for idx, frame in enumerate(video_frames):
                     out.write(frame)
+                    if idx % (fps * 2) == 0 and idx > 0:  # Log every ~2 seconds of video
+                        logger.info(f"📝 Wrote {idx}/{len(video_frames)} frames ({(idx/len(video_frames))*100:.1f}%)")
                 out.release()
                 
                 # Verify and summarize
