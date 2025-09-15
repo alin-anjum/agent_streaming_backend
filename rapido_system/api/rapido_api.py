@@ -35,6 +35,7 @@ sys.path.extend([api_dir, rapido_system_root, os.path.join(rapido_system_root, '
 
 # Import Rapido system
 from rapido_main import RapidoMainSystem
+from video_job_service import fetch_and_store_video_job
 
 # Setup logging
 logging.basicConfig(
@@ -279,6 +280,15 @@ async def generate_livekit_token_endpoint(request: LiveKitTokenRequest):
     """Generate LiveKit JWT token after authentication validation"""
     try:
         logger.info(f"🔑 Token request for lesson: {request.lessonId}, user: {request.userId}, session: {request.sessionId}, jobId: {request.videoJobId}")
+        
+        # Kick off background fetch-and-store of video job data
+        async def _on_fetch():
+            try:
+                saved_path = await fetch_and_store_video_job(request.videoJobId)
+                logger.info(f"💾 Video job data saved to {saved_path}")
+            except Exception as e:
+                logger.error(f"❌ Failed to fetch/store video job {request.videoJobId}: {e}")
+        asyncio.create_task(_on_fetch())
         
         # Step 1: Authenticate with Creatium API
         # TEMPORARILY BYPASSED FOR TESTING - uncomment for production
