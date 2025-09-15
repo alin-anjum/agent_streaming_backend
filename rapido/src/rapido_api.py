@@ -102,6 +102,7 @@ class LiveKitTokenRequest(BaseModel):
     sessionId: str
     organizationId: str
     authToken: str
+    captureUrl: str
 
 class AuthenticateDocumentPayload(BaseModel):
     id: str         # lessonId
@@ -307,7 +308,7 @@ async def generate_livekit_token_endpoint(request: LiveKitTokenRequest):
         # Step 3: Smart room management - only start avatar if room doesn't have one
         if await should_start_avatar_in_room(room_name):
             logger.info(f"🚀 Starting new avatar in room {room_name}")
-            asyncio.create_task(auto_start_presentation(room_name, request.lessonId, request.videoJobId))
+            asyncio.create_task(auto_start_presentation(room_name, request.lessonId, request.videoJobId, request.captureUrl))
         else:
             logger.info(f"👥 Avatar already active in room {room_name} - user joining existing presentation")
         
@@ -352,7 +353,7 @@ async def should_start_avatar_in_room(room_name: str) -> bool:
     logger.info(f"🔍 Room {room_name} is empty - can start avatar")
     return True
 
-async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: str):
+async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: str, captureUrl: str):
     """Auto-start avatar presentation when someone gets a token"""
     session_id = f"avatar_{lesson_id}_{int(time.time())}"
     
@@ -383,7 +384,8 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         config_override = {
             'LIVEKIT_ROOM': room_name,
             'USE_DYNAMIC_CAPTURE': True,  # Enable dynamic capture like direct execution
-            'CAPTURE_URL': f'https://xgzhc339-5173.inc1.devtunnels.ms/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4'  # Use lesson_id for capture URL
+            'CAPTURE_URL': 'https://xgzhc339-5173.inc1.devtunnels.ms/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4',  # Use videoJobId for capture URL
+            'VIDEO_JOB_ID': '81eceadf-2503-4915-a2bf-12eb252329e4'  # Pass video job ID for document capture
         }
         rapido = RapidoMainSystem(config_override)
         session_info["rapido_system"] = rapido

@@ -178,7 +178,8 @@ class FrameOverlayEngine:
         position: str = "bottom-right",
         scale: float = 0.3,
         offset: Tuple[int, int] = (50, 50),
-        blend_mode: str = "normal"
+        blend_mode: str = "normal",
+        fixed_size: Optional[Tuple[int, int]] = None
     ) -> Image.Image:
         """
         Overlay avatar frame onto slide frame.
@@ -187,9 +188,10 @@ class FrameOverlayEngine:
             slide_frame: Background slide frame
             avatar_frame: Avatar frame to overlay
             position: Position for avatar ("bottom-right", "bottom-left", "top-right", "top-left", "center", "center-bottom")
-            scale: Scale factor for avatar frame
+            scale: Scale factor for avatar frame (ignored if fixed_size is provided)
             offset: Offset from edge in pixels (x, y)
             blend_mode: Blending mode ("normal", "multiply", "screen", "overlay")
+            fixed_size: Fixed dimensions (width, height) for avatar. If provided, overrides scale.
             
         Returns:
             PIL.Image: Composited frame
@@ -198,9 +200,16 @@ class FrameOverlayEngine:
             # Create a copy of the slide frame
             result_frame = slide_frame.copy()
             
-            # Scale avatar frame
-            avatar_width = int(avatar_frame.width * scale)
-            avatar_height = int(avatar_frame.height * scale)
+            # Determine avatar dimensions
+            if fixed_size is not None:
+                # Use fixed dimensions
+                avatar_width, avatar_height = fixed_size
+            else:
+                # Use scale factor
+                avatar_width = int(avatar_frame.width * scale)
+                avatar_height = int(avatar_frame.height * scale)
+            
+            # Resize avatar frame
             scaled_avatar = avatar_frame.resize((avatar_width, avatar_height), Image.Resampling.LANCZOS)
             
             # Calculate position

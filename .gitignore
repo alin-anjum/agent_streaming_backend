@@ -55,6 +55,7 @@ tmp/
 captured_frames/
 browser_data/
 .browser_run_count
+captured_documents/
 
 # OS
 .DS_Store

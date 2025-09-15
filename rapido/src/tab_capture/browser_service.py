@@ -18,6 +18,8 @@ try:
 except ImportError:
     raise ImportError("Playwright not installed. Run: pip install playwright && playwright install chromium")
 
+from .network_monitor import capture_document_from_network, extract_video_job_id_from_url
+
 logger = logging.getLogger(__name__)
 
 class BrowserConfig:
@@ -44,8 +46,9 @@ class BrowserConfig:
 class BrowserAutomationService:
     """Browser automation service for dynamic frame capture"""
     
-    def __init__(self, config: BrowserConfig = None):
+    def __init__(self, config: BrowserConfig = None, video_job_id: Optional[str] = None):
         self.config = config or BrowserConfig()
+        self.video_job_id = video_job_id
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
@@ -61,6 +64,8 @@ class BrowserAutomationService:
         
         logger.info("🚀 Browser Automation Service initialized")
         logger.info(f"📁 Frames will be saved to: {self.config.download_folder}")
+        if self.video_job_id:
+            logger.info(f"🆔 Video Job ID: {self.video_job_id} (will capture document)")
         
         # Check if cleanup is needed
         if self._should_cleanup_before_start():
@@ -126,13 +131,54 @@ class BrowserAutomationService:
         try:
             logger.info(f"🌐 Navigating to: {self.config.capture_url}")
             
-            # Navigate to the capture URL
-            await self.page.goto(self.config.capture_url, wait_until="networkidle", timeout=30000)
+            # Check if this is a slide-specific URL (contains slideId parameter)
+            is_slide_specific_url = "slideId=" in self.config.capture_url
+            video_job_id = self.video_job_id
             
-            logger.info("✅ Page loaded successfully")
+            if not video_job_id:
+                logger.info(f"🔍 No video job ID provided - skipping document capture")
+            elif is_slide_specific_url:
+                logger.info(f"🔍 Slide-specific URL detected - skipping document capture (already done)")
             
-            # Wait a moment for any dynamic content to load
-            await asyncio.sleep(2)
+            captured_doc = None
+            if video_job_id and not is_slide_specific_url:
+                logger.info(f"📄 Starting network monitoring BEFORE navigation for video job ID: {video_job_id}")
+                
+                # Start monitoring before navigation
+                from .network_monitor import NetworkDocumentCapture
+                monitor = NetworkDocumentCapture(video_job_id, "./captured_documents")
+                await monitor.start_monitoring(self.page)
+                
+                # Navigate to the capture URL while monitoring is active
+                await self.page.goto(self.config.capture_url, wait_until="networkidle", timeout=30000)
+                logger.info("✅ Page loaded successfully")
+                
+                # Wait a moment for any additional requests
+                await asyncio.sleep(3)
+                
+                # Check if we captured the document during navigation
+                if monitor.is_capture_complete():
+                    captured_doc = monitor.get_captured_document()
+                    logger.info(f"✅ Document captured during navigation: {captured_doc['file_path']}")
+                else:
+                    # Wait a bit more for any delayed requests
+                    logger.info("⏳ Waiting for additional network requests...")
+                    start_time = asyncio.get_event_loop().time()
+                    while not monitor.is_capture_complete() and (asyncio.get_event_loop().time() - start_time) < 30:
+                        await asyncio.sleep(1)
+                    
+                    if monitor.is_capture_complete():
+                        captured_doc = monitor.get_captured_document()
+                        logger.info(f"✅ Document captured after additional wait: {captured_doc['file_path']}")
+                    else:
+                        logger.warning(f"⚠️ No document captured for video job ID: {video_job_id}")
+                
+                monitor.stop_monitoring()
+            else:
+                # Navigate normally without monitoring (for slide-specific URLs)
+                await self.page.goto(self.config.capture_url, wait_until="networkidle", timeout=30000)
+                logger.info("✅ Page loaded successfully")
+                await asyncio.sleep(2)
             
             # Handle tunnel protection if present
             logger.info("🔍 Checking for tunnel protection after navigation...")

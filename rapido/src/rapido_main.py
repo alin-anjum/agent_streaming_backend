@@ -172,7 +172,10 @@ class RapidoMainSystem:
         # Dynamic frame capture configuration
         self.use_dynamic_capture = getattr(self.config, 'USE_DYNAMIC_CAPTURE', False)
         self.capture_url = getattr(self.config, 'CAPTURE_URL', 'https://test.creatium.com/presentation')
+        self.video_job_id = getattr(self.config, 'VIDEO_JOB_ID', None)
         logger.info(f"🔍 Dynamic capture config: USE_DYNAMIC_CAPTURE={self.use_dynamic_capture}, CAPTURE_URL={self.capture_url}")
+        if self.video_job_id:
+            logger.info(f"🆔 Video Job ID for document capture: {self.video_job_id}")
 
         # Real-time slide frame streaming (tab-capture) additions - EXACT SYNCTALK PATTERN
         # Mirror the exact SyncTalk pattern: asyncio.Queue with producer task
@@ -1739,7 +1742,8 @@ class RapidoMainSystem:
             from tab_capture.capture_api import capture_presentation_frames_to_queue
             success = await capture_presentation_frames_to_queue(
                 capture_url=self.capture_url,
-                frame_queue=self.slide_frame_queue
+                frame_queue=self.slide_frame_queue,
+                video_job_id=self.video_job_id
             )
             
             if not success:

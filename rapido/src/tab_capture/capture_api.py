@@ -16,7 +16,7 @@ from .frame_processor import DynamicFrameProcessor
 
 logger = logging.getLogger(__name__)
 
-async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: asyncio.Queue, duration_seconds: Optional[int] = None) -> bool:
+async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: asyncio.Queue, duration_seconds: Optional[int] = None, video_job_id: Optional[str] = None) -> bool:
     """
     Start Playwright capture and feed frames directly to queue (no file system)
     """
@@ -34,13 +34,13 @@ async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: as
         config.tab_capture_wait_seconds = duration_seconds or 300  # 5 min max if auto-detect
         
         # Create and start browser service
-        browser_service = BrowserAutomationService(config)
+        browser_service = BrowserAutomationService(config, video_job_id=video_job_id)
         
         if not await browser_service.start():
             logger.error("❌ Failed to start browser service")
             return False
         
-        # Navigate and setup capture
+        # Navigate and setup capture (includes document capture if video_job_id provided)
         if not await browser_service.navigate_and_setup_capture():
             logger.error("❌ Failed to navigate and setup capture")
             await browser_service.cleanup()
@@ -85,7 +85,7 @@ async def capture_presentation_frames(capture_url: str, duration_seconds: Option
         config.capture_url = capture_url
         config.tab_capture_wait_seconds = duration_seconds or 300  # 5 min max if auto-detect
         
-        # Create and start browser service
+        # Create and start browser service  
         browser_service = BrowserAutomationService(config)
         
         if not await browser_service.start():

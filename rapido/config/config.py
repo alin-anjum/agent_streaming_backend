@@ -16,7 +16,7 @@ class Config:
     # Frame Configuration
     FRAME_RATE = int(os.getenv('FRAME_RATE', '30'))  # FPS for output video
     AVATAR_OVERLAY_POSITION = os.getenv('AVATAR_OVERLAY_POSITION', 'bottom-right')  # Position for avatar overlay
-    AVATAR_SCALE = float(os.getenv('AVATAR_SCALE', '0.5'))  # Scale factor for avatar frames (increased)
+    AVATAR_SCALE = float(os.getenv('AVATAR_SCALE', '0.5'))  # Scale factor for avatar frames (legacy - now using fixed 400x400)
     
     # File Paths
     INPUT_DATA_PATH = os.getenv('INPUT_DATA_PATH', '../test1.json')
@@ -38,7 +38,7 @@ class Config:
 
     # Dynamic frame capture settings
     USE_DYNAMIC_CAPTURE = os.getenv('USE_DYNAMIC_CAPTURE', 'True').lower() == 'true'
-    CAPTURE_URL = os.getenv('CAPTURE_URL', 'http://localhost:5173/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4')
+    CAPTURE_URL = os.getenv('CAPTURE_URL', 'https://xgzhc339-5173.inc1.devtunnels.ms/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4')
     
     # LiveKit room configuration (can be overridden by FastAPI)
     LIVEKIT_ROOM = os.getenv('LIVEKIT_ROOM', 'default-room')
