@@ -38,7 +38,7 @@ class Config:
 
     # Dynamic frame capture settings
     USE_DYNAMIC_CAPTURE = os.getenv('USE_DYNAMIC_CAPTURE', 'True').lower() == 'true'
-    CAPTURE_URL = os.getenv('CAPTURE_URL', 'https://xgzhc339-5173.inc1.devtunnels.ms/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4')
+    CAPTURE_URL = os.getenv('CAPTURE_URL', 'https://test.creatium.com/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4')
     
     # LiveKit room configuration (can be overridden by FastAPI)
     LIVEKIT_ROOM = os.getenv('LIVEKIT_ROOM', 'default-room')

@@ -652,7 +652,7 @@ class BrowserAutomationService:
                     
                     if buffer_size > total_saved:
                         # Process canvas frames
-                        frames_to_process = min(buffer_size - total_saved, 8)
+                        frames_to_process = min(buffer_size - total_saved, 25)  # Increased from 8 to 25 for faster capture
                         
                         for frame_idx in range(total_saved, min(total_saved + frames_to_process, buffer_size)):
                             try:
@@ -712,7 +712,7 @@ class BrowserAutomationService:
                         logger.info(f"📸 Saved {total_saved} frames in {elapsed:.1f}s ({fps:.1f} FPS)")
                     
                     # Sleep for next cycle
-                    await asyncio.sleep(0.04)  # 25 FPS timing
+                    await asyncio.sleep(0.01)  # 100 Hz timing - much faster for capture throughput
                     
                 except Exception as e:
                     logger.debug(f"Error in monitoring loop: {e}")
@@ -760,7 +760,7 @@ class BrowserAutomationService:
                     
                     if buffer_size > total_saved:
                         # Process canvas frames
-                        frames_to_process = min(buffer_size - total_saved, 8)
+                        frames_to_process = min(buffer_size - total_saved, 25)  # Increased from 8 to 25 for faster capture
                         
                         for frame_idx in range(total_saved, min(total_saved + frames_to_process, buffer_size)):
                             try:
@@ -845,7 +845,7 @@ class BrowserAutomationService:
                         logger.info(f"📸 Fed {total_saved} frames to queue in {elapsed:.1f}s ({fps:.1f} FPS, queue size: {queue_size})")
                     
                     # Sleep for next cycle
-                    await asyncio.sleep(0.04)  # 25 FPS timing
+                    await asyncio.sleep(0.01)  # 100 Hz timing - much faster for capture throughput
                     
                 except Exception as e:
                     logger.debug(f"Error in monitoring loop: {e}")
@@ -886,7 +886,7 @@ class BrowserAutomationService:
                     
                     if buffer_size > total_saved:
                         # Process new frames (optimized batch size for performance)
-                        frames_to_process = min(buffer_size - total_saved, 8)
+                        frames_to_process = min(buffer_size - total_saved, 25)  # Increased from 8 to 25 for faster capture
                         
                         for frame_idx in range(total_saved, min(total_saved + frames_to_process, buffer_size)):
                             try:
@@ -943,7 +943,7 @@ class BrowserAutomationService:
                         break
                     
                     # Short sleep to avoid busy waiting
-                    await asyncio.sleep(0.02)  # 50Hz check rate
+                    await asyncio.sleep(0.01)  # 100Hz check rate - faster monitoring
                     
                 except Exception as e:
                     logger.debug(f"Error in monitoring loop: {e}")
@@ -988,7 +988,7 @@ class BrowserAutomationService:
                     
                     if buffer_size > total_saved:
                         # Process new frames (optimized batch size for performance)
-                        frames_to_process = min(buffer_size - total_saved, 8)
+                        frames_to_process = min(buffer_size - total_saved, 25)  # Increased from 8 to 25 for faster capture
                         
                         for frame_idx in range(total_saved, min(total_saved + frames_to_process, buffer_size)):
                             try:

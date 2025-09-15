@@ -52,10 +52,11 @@ app = FastAPI(
 # CORS middleware for frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=False,  # Set to False when using allow_origins=["*"]
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Add middleware to log all requests and handle URL issues
@@ -384,7 +385,7 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         config_override = {
             'LIVEKIT_ROOM': room_name,
             'USE_DYNAMIC_CAPTURE': True,  # Enable dynamic capture like direct execution
-            'CAPTURE_URL': 'https://xgzhc339-5173.inc1.devtunnels.ms/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4',  # Use videoJobId for capture URL
+            'CAPTURE_URL': 'https://test.creatium.com/video-capture/81eceadf-2503-4915-a2bf-12eb252329e4',  # Use videoJobId for capture URL
             'VIDEO_JOB_ID': '81eceadf-2503-4915-a2bf-12eb252329e4'  # Pass video job ID for document capture
         }
         rapido = RapidoMainSystem(config_override)
@@ -412,20 +413,56 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         # Update session status
         session_info["status"] = "streaming"
         
-        # Load actual lesson content - use existing test1.json for now
-        # TODO: Replace with actual lesson content loading based on lesson_id
-        from data_parser import SlideDataParser
+        # Load actual lesson content from captured document
+        from tab_capture.document_parser import extract_canvas_slides_with_narration
+        import os
+        import json
+        from pathlib import Path
         
-        # Use existing test content (replace with real lesson loading)
-        test_json_path = "/home/ubuntu/agent_streaming_backend/test1.json"
-        parser = SlideDataParser(test_json_path)
+        # Find the latest captured document for this video job ID
+        document_dir = Path("./captured_documents")
+        document_pattern = f"document_{video_job_id}_*.json"
         
-        if parser.load_data():
-            actual_narration = parser.get_narration_text()
-            logger.info(f"📝 Loaded actual narration: {len(actual_narration)} characters")
+        matching_files = list(document_dir.glob(document_pattern))
+        
+        if matching_files:
+            # Get the most recent document file
+            latest_document = max(matching_files, key=lambda f: f.stat().st_mtime)
+            logger.info(f"📄 Loading lesson content from: {latest_document}")
+            
+            try:
+                with open(latest_document, 'r', encoding='utf-8') as f:
+                    document_data = json.load(f)
+                
+                # Extract canvas slides with narration
+                canvas_slides = extract_canvas_slides_with_narration(document_data)
+                
+                if canvas_slides:
+                    # Combine all narration texts
+                    narration_parts = []
+                    for slide_id, slide_data in canvas_slides.items():
+                        if slide_data['narration'] and slide_data['narration'].strip():
+                            narration_parts.append(slide_data['narration'].strip())
+                    
+                    if narration_parts:
+                        actual_narration = ' '.join(narration_parts)
+                        logger.info(f"📝 Loaded actual narration from document: {len(actual_narration)} characters")
+                        logger.info(f"📊 Combined narration from {len(canvas_slides)} canvas slides")
+                        logger.info(f"📝 Narration preview: {actual_narration[:200]}...")
+                    else:
+                        logger.warning("No narration text found in document - using fallback")
+                        actual_narration = "No narration content found in the captured document."
+                else:
+                    logger.warning("No canvas slides found in document - using fallback")
+                    actual_narration = "No canvas slides found in the captured document."
+                    
+            except Exception as e:
+                logger.error(f"Failed to parse document {latest_document}: {e}")
+                actual_narration = "Failed to parse lesson document content."
+                
         else:
-            logger.error("Failed to load lesson content - using fallback")
-            actual_narration = "Failed to load lesson content"
+            logger.error(f"No document found for video job ID: {video_job_id}")
+            actual_narration = "No lesson document was captured for this presentation."
         
         success = await rapido.stream_real_time_tts(actual_narration)
         
@@ -562,6 +599,7 @@ if __name__ == "__main__":
     
     logger.info(f"Starting Rapido API on {HOST}:{PORT}")
     logger.info(f"🔍 Enhanced logging enabled - will capture all requests including invalid ones")
+    logger.info(f"🔒 SSL termination handled by nginx reverse proxy")
     
     uvicorn.run(
         app,
