@@ -179,7 +179,8 @@ class FrameOverlayEngine:
         scale: float = 0.3,
         offset: Tuple[int, int] = (50, 50),
         blend_mode: str = "normal",
-        fixed_size: Optional[Tuple[int, int]] = None
+        fixed_size: Optional[Tuple[int, int]] = None,
+        absolute_position: Optional[Tuple[int, int]] = None
     ) -> Image.Image:
         """
         Overlay avatar frame onto slide frame.
@@ -213,12 +214,15 @@ class FrameOverlayEngine:
             scaled_avatar = avatar_frame.resize((avatar_width, avatar_height), Image.Resampling.LANCZOS)
             
             # Calculate position
-            x, y = self._calculate_position(
-                result_frame.size,
-                (avatar_width, avatar_height),
-                position,
-                offset
-            )
+            if absolute_position is not None:
+                x, y = absolute_position
+            else:
+                x, y = self._calculate_position(
+                    result_frame.size,
+                    (avatar_width, avatar_height),
+                    position,
+                    offset
+                )
             
             # Apply blending
             if blend_mode == "normal":

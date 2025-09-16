@@ -26,16 +26,23 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
-# Add paths for imports
+# Compute roots and prefer absolute imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
 api_dir = current_dir
 rapido_system_root = os.path.dirname(api_dir)
 project_root = os.path.dirname(rapido_system_root)
-sys.path.extend([api_dir, rapido_system_root, os.path.join(rapido_system_root, 'core'), os.path.join(project_root, 'SyncTalk_2D')])
 
-# Import Rapido system
-from rapido_main import RapidoMainSystem
-from video_job_service import fetch_and_store_video_job
+# Ensure project root is on sys.path so 'rapido_system' is importable even when running from subdirs
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+# Add SyncTalk_2D for frame protobufs
+sync_talk_path = os.path.join(project_root, 'SyncTalk_2D')
+if sync_talk_path not in sys.path:
+    sys.path.append(sync_talk_path)
+
+from rapido_system.api.rapido_main import RapidoMainSystem
+from rapido_system.api.video_job_service import fetch_and_store_video_job
 
 # Setup logging
 logging.basicConfig(
@@ -426,56 +433,62 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         # Update session status
         session_info["status"] = "streaming"
         
-        # Load actual lesson content from captured document
+        # Load actual lesson content - prefer parsed_slideData format; fallback to captured_documents
         from tab_capture.document_parser import extract_canvas_slides_with_narration
         import os
         import json
         from pathlib import Path
-        
-        # Find the latest captured document for this video job ID
-        document_dir = Path("./captured_documents")
-        document_pattern = f"document_{video_job_id}_*.json"
-        
-        matching_files = list(document_dir.glob(document_pattern))
-        
-        if matching_files:
-            # Get the most recent document file
-            latest_document = max(matching_files, key=lambda f: f.stat().st_mtime)
-            logger.info(f"📄 Loading lesson content from: {latest_document}")
-            
-            try:
-                with open(latest_document, 'r', encoding='utf-8') as f:
-                    document_data = json.load(f)
-                
-                # Extract canvas slides with narration
-                canvas_slides = extract_canvas_slides_with_narration(document_data)
-                
-                if canvas_slides:
-                    # Combine all narration texts
-                    narration_parts = []
-                    for slide_id, slide_data in canvas_slides.items():
-                        if slide_data['narration'] and slide_data['narration'].strip():
-                            narration_parts.append(slide_data['narration'].strip())
-                    
-                    if narration_parts:
-                        actual_narration = ' '.join(narration_parts)
-                        logger.info(f"📝 Loaded actual narration from document: {len(actual_narration)} characters")
-                        logger.info(f"📊 Combined narration from {len(canvas_slides)} canvas slides")
-                        logger.info(f"📝 Narration preview: {actual_narration[:200]}...")
-                    else:
-                        logger.warning("No narration text found in document - using fallback")
-                        actual_narration = "No narration content found in the captured document."
-                else:
-                    logger.warning("No canvas slides found in document - using fallback")
-                    actual_narration = "No canvas slides found in the captured document."
-                    
-            except Exception as e:
-                logger.error(f"Failed to parse document {latest_document}: {e}")
-                actual_narration = "Failed to parse lesson document content."
-                
-        else:
-            logger.error(f"No document found for video job ID: {video_job_id}")
-            actual_narration = "No lesson document was captured for this presentation."
+
+        actual_narration = None
+
+        # 1) Try parsed_slideData (new unified format)
+        try:
+            parsed_path = Path(f"./rapido_system/data/parsed_slideData/{video_job_id}.json")
+            if parsed_path.exists():
+                with open(parsed_path, 'r', encoding='utf-8') as f:
+                    parsed_data = json.load(f)
+                slides = parsed_data.get('slides', [])
+                narration_parts = []
+                for slide in slides:
+                    slide_info = slide.get('slideInfo', {}) if isinstance(slide, dict) else {}
+                    text = slide_info.get('narrationData', '')
+                    if isinstance(text, str) and text.strip():
+                        narration_parts.append(text.strip())
+                if narration_parts:
+                    actual_narration = ' '.join(narration_parts)
+                    logger.info(f"📝 Loaded narration from parsed_slideData: {parsed_path} ({len(actual_narration)} chars)")
+                    logger.info(f"📝 Narration preview: {actual_narration[:200]}...")
+        except Exception as e:
+            logger.warning(f"Failed to read parsed_slideData for {video_job_id}: {e}")
+
+        # 2) Fallback: captured_documents original format
+        if not actual_narration:
+            document_dir = Path("./captured_documents")
+            document_pattern = f"document_{video_job_id}_*.json"
+            matching_files = list(document_dir.glob(document_pattern))
+            if matching_files:
+                latest_document = max(matching_files, key=lambda f: f.stat().st_mtime)
+                logger.info(f"📄 Loading lesson content from: {latest_document}")
+                try:
+                    with open(latest_document, 'r', encoding='utf-8') as f:
+                        document_data = json.load(f)
+                    canvas_slides = extract_canvas_slides_with_narration(document_data)
+                    if canvas_slides:
+                        narration_parts = []
+                        for slide_id, slide_data in canvas_slides.items():
+                            if slide_data['narration'] and slide_data['narration'].strip():
+                                narration_parts.append(slide_data['narration'].strip())
+                        if narration_parts:
+                            actual_narration = ' '.join(narration_parts)
+                            logger.info(f"📝 Loaded narration from captured document ({len(actual_narration)} chars)")
+                            logger.info(f"📝 Narration preview: {actual_narration[:200]}...")
+                except Exception as e:
+                    logger.error(f"Failed to parse document {latest_document}: {e}")
+
+        # 3) Final fallback
+        if not actual_narration or not actual_narration.strip():
+            logger.error(f"No narration found for job {video_job_id}; using fallback message")
+            actual_narration = "No narration content available for this presentation."
         
         success = await rapido.stream_real_time_tts(actual_narration)
         

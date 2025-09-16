@@ -6,6 +6,7 @@ import aiohttp
 from elevenlabs.client import ElevenLabs
 from elevenlabs import play
 import io
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ class ElevenLabsTTSClient:
         try:
             logger.info(f"Starting TTS stream for text: {text[:50]}...")
             
-            # Use the new ElevenLabs API in an executor to avoid blocking
+            # Create the ElevenLabs streaming generator in a worker thread
             loop = asyncio.get_event_loop()
             
             def generate_streaming_audio():
@@ -44,24 +45,35 @@ class ElevenLabsTTSClient:
                     model_id=self.model
                 )
             
-            # Run the streaming TTS generation in a thread pool
             audio_stream = await loop.run_in_executor(None, generate_streaming_audio)
             
-            # Stream the real-time audio chunks from ElevenLabs
-            def process_stream():
-                chunks = []
-                for chunk in audio_stream:
-                    if isinstance(chunk, bytes):
-                        chunks.append(chunk)
-                return chunks
+            # Bridge producer thread -> asyncio via an asyncio.Queue
+            queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
             
-            # Get chunks as they come in
-            audio_chunks = await loop.run_in_executor(None, process_stream)
+            def producer():
+                try:
+                    for chunk in audio_stream:
+                        if isinstance(chunk, bytes) and len(chunk) > 0:
+                            try:
+                                loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                            except Exception:
+                                # If loop or queue is unavailable, stop producing
+                                break
+                finally:
+                    # Signal completion
+                    try:
+                        loop.call_soon_threadsafe(queue.put_nowait, None)
+                    except Exception:
+                        pass
             
-            # Yield the actual streaming chunks
-            for chunk in audio_chunks:
-                if chunk:
-                    yield chunk
+            threading.Thread(target=producer, daemon=True).start()
+            
+            # Consume chunks as they arrive without buffering the whole narration
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield chunk
                     
         except Exception as e:
             logger.error(f"Error in TTS streaming: {e}")
@@ -95,7 +107,7 @@ class ElevenLabsTTSClient:
             raise
     
     async def _stream_single_text_chunk(self, text: str, chunk_callback, loop):
-        """Stream a single text chunk"""
+        """Stream a single text chunk without blocking the event loop"""
         def generate_stream():
             return self.client.text_to_speech.stream(
                 text=text,
@@ -106,35 +118,45 @@ class ElevenLabsTTSClient:
         
         audio_stream = await loop.run_in_executor(None, generate_stream)
         
+        # Use a background thread to iterate the ElevenLabs generator and push into asyncio queue
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        
+        def producer():
+            total = 0
+            try:
+                for raw_chunk in audio_stream:
+                    if isinstance(raw_chunk, bytes) and len(raw_chunk) > 0:
+                        total += len(raw_chunk)
+                        try:
+                            loop.call_soon_threadsafe(queue.put_nowait, raw_chunk)
+                        except Exception:
+                            break
+            finally:
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
+                except Exception:
+                    pass
+                logger.info(f"📊 ElevenLabs streaming completed - {total} bytes received")
+        
+        threading.Thread(target=producer, daemon=True).start()
+        
         # Buffer for accumulating larger chunks for better SyncTalk performance
         audio_buffer = b''
-        # Try 160ms chunks (4 frames) = 640 * 4 = 2,560 samples = 5,120 bytes
-        target_chunk_size = 5120  # 160ms of 16kHz audio (4 video frames)
+        target_chunk_size = 5120  # 160ms at 16kHz (int16 mono)
         chunk_count = 0
         
-        # Process chunks as they arrive and repackage into 160ms chunks
-        total_bytes_received = 0
-        try:
-            for raw_chunk in audio_stream:
-                if isinstance(raw_chunk, bytes) and len(raw_chunk) > 0:
-                    audio_buffer += raw_chunk
-                    total_bytes_received += len(raw_chunk)
-                    
-                    # Send 160ms chunks when we have enough data
-                    while len(audio_buffer) >= target_chunk_size:
-                        chunk_160ms = audio_buffer[:target_chunk_size]
-                        audio_buffer = audio_buffer[target_chunk_size:]
-                        
-                        chunk_count += 1
-                        logger.debug(f"160ms chunk {chunk_count}: {len(chunk_160ms)} bytes")
-                        await chunk_callback(chunk_160ms)
+        while True:
+            raw_chunk = await queue.get()
+            if raw_chunk is None:
+                break
+            audio_buffer += raw_chunk
             
-            logger.info(f"📊 ElevenLabs streaming completed - {total_bytes_received} bytes received")
-            
-        except Exception as e:
-            logger.error(f"🚨 ElevenLabs streaming error: {e}")
-            logger.info(f"📊 Partial data received: {total_bytes_received} bytes before error")
-            raise
+            while len(audio_buffer) >= target_chunk_size:
+                chunk_160ms = audio_buffer[:target_chunk_size]
+                audio_buffer = audio_buffer[target_chunk_size:]
+                chunk_count += 1
+                logger.debug(f"160ms chunk {chunk_count}: {len(chunk_160ms)} bytes")
+                await chunk_callback(chunk_160ms)
         
         # Send remaining data as final chunk
         if audio_buffer:

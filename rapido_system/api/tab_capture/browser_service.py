@@ -352,7 +352,7 @@ class BrowserAutomationService:
                                 image_bytes = base64.b64decode(frame_data.split(',')[1])
                                 from PIL import Image
                                 import io
-                                frame_image = Image.open(io.BytesIO(image_bytes)).resize((854, 480))
+                                frame_image = Image.open(io.BytesIO(image_bytes)).resize((1280, 720))
                                 break
                         await asyncio.sleep(0.05)
                 except Exception as e:
@@ -367,7 +367,7 @@ class BrowserAutomationService:
                             image_bytes = base64.b64decode(result['data'])
                             from PIL import Image
                             import io
-                            frame_image = Image.open(io.BytesIO(image_bytes)).resize((854, 480))
+                            frame_image = Image.open(io.BytesIO(image_bytes)).resize((1280, 720))
                     except Exception as e:
                         logger.debug(f"CDP screenshot failed: {e}")
 
@@ -983,7 +983,7 @@ class BrowserAutomationService:
                                     import io
                                     
                                     image_data = base64.b64decode(frame_data.split(',')[1])
-                                    frame_image = Image.open(io.BytesIO(image_data)).resize((854, 480))
+                                    frame_image = Image.open(io.BytesIO(image_data)).resize((1920, 1080))
                                     
                                     # Put frame in queue (non-blocking)
                                     try:
@@ -1020,7 +1020,7 @@ class BrowserAutomationService:
                                 import io
                                 
                                 image_data = base64.b64decode(result['data'])
-                                frame_image = Image.open(io.BytesIO(image_data)).resize((854, 480))
+                                frame_image = Image.open(io.BytesIO(image_data)).resize((1920, 1080))
                                 
                                 # Put frame in queue (non-blocking)
                                 try:

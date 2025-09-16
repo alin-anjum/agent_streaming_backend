@@ -46,23 +46,17 @@ import threading
 # Import optimized modules (will check after logger is set up)
 OPTIMIZATIONS_AVAILABLE = False
 
-# Add paths for imports
+# Compute project roots once
 current_dir = os.path.dirname(os.path.abspath(__file__))
 api_dir = current_dir
 rapido_system_root = os.path.dirname(api_dir)
 project_root = os.path.dirname(rapido_system_root)
 
-# Add paths for imports
-sys.path.append(api_dir)
-sys.path.append(rapido_system_root)
-sys.path.append(os.path.join(rapido_system_root, 'core'))
-sys.path.append(os.path.join(project_root, 'SyncTalk_2D'))
-
-# Import Rapido modules
-from config.config import Config
-from data_parser import SlideDataParser
-from tts_client import ElevenLabsTTSClient
-from frame_processor import FrameOverlayEngine
+# Prefer absolute package imports (avoid sys.path hacks where possible)
+from rapido_system.core.config.config import Config
+from rapido_system.api.data_parser import SlideDataParser
+from rapido_system.api.tts_client import ElevenLabsTTSClient
+from rapido_system.api.frame_processor import FrameOverlayEngine
 
 # Setup logging first
 logging.basicConfig(
@@ -83,9 +77,8 @@ except ImportError as e:
     logger.warning(f"⚠️ Optimized modules not available: {e}")
     OPTIMIZATIONS_AVAILABLE = False
 
-# Import SyncTalk protobuf
+# Import SyncTalk protobuf (module lives in SyncTalk_2D)
 try:
-    # Add SyncTalk_2D to path and import
     synctalk_path = os.path.join(project_root, 'SyncTalk_2D')
     if synctalk_path not in sys.path:
         sys.path.insert(0, synctalk_path)
@@ -131,6 +124,11 @@ class RapidoMainSystem:
         self.end_of_stream_sent = False  # Prevent any audio sends after EOS
         self._video_writer = None        # OpenCV VideoWriter for final MP4
         self._video_output_path = None   # Path to saved video
+        self._composed_frames_dir = None # Directory to save composed frames
+        self._composed_frame_index = 0   # Incremental index for saved frames
+        self._audio_pcm_path = None      # Path to raw PCM during composition
+        self._audio_wav_path = None      # Final WAV path (converted from PCM)
+        self._final_mp4_path = None      # Final stitched video output
         self.avatar_frames = []
         self.avatar_audio_chunks = []
         # Get the script directory and resolve paths relative to the project root
@@ -196,6 +194,15 @@ class RapidoMainSystem:
         self._cache_lock = asyncio.Lock()  # Thread safety for cache operations
         self.dynamic_frame_processor = None
         self.dynamic_frames_dir = None  # Set after capture starts
+        self.presenter_map = {}
+        self.doc_canvas_size = (1920, 1080)
+        # Slide timing offset: negative advances earlier (frames at 25fps). Default -30 (~1.2s)
+        try:
+            self.slide_timing_offset_frames = int(getattr(self.config, 'SLIDE_TIMING_OFFSET_FRAMES', -30))
+        except Exception:
+            self.slide_timing_offset_frames = -30
+        # Clamp offset to a safe range
+        self.slide_timing_offset_frames = max(-60, min(0, self.slide_timing_offset_frames))
 
         # Initialize frame processor based on capture mode
         if self.use_dynamic_capture:
@@ -204,15 +211,20 @@ class RapidoMainSystem:
             # Create a dummy empty directory to avoid loading any static frames
             import tempfile
             temp_dir = tempfile.mkdtemp()
-            self.frame_processor = FrameOverlayEngine(temp_dir, output_size=(854, 480), dynamic_mode=True)
+            self.frame_processor = FrameOverlayEngine(temp_dir, output_size=(1280, 720), dynamic_mode=True)
             self.total_slide_frames = 0
             self.total_duration_seconds = 0
         else:
             # For static frames, load the presentation frames
             logger.info("📁 Static frame mode - loading presentation frames")
-            self.frame_processor = FrameOverlayEngine(self.slide_frames_path, output_size=(854, 480))
+            self.frame_processor = FrameOverlayEngine(self.slide_frames_path, output_size=(1280, 720))
             self.total_slide_frames = self.frame_processor.get_frame_count()
         self.total_duration_seconds = self.total_slide_frames / self.synctalk_fps
+        # Try to load presenter positions from captured document
+        try:
+            self._load_presenter_positions()
+        except Exception as e:
+            logger.warning(f"Presenter position map not loaded: {e}")
         
         # Initialize chroma key processor
         self.chroma_key_processor = None
@@ -221,6 +233,25 @@ class RapidoMainSystem:
         # Performance optimization: cache morphological kernel
         self._morph_kernel = None
         self._frame_count = 0
+        
+        # Precompute composed output targets
+        try:
+            safe_suffix = self.video_job_id if self.video_job_id else str(int(time.time()))
+            os.makedirs(self.output_dir, exist_ok=True)
+            self._composed_frames_dir = os.path.join(self.output_dir, f"composed_frames_{safe_suffix}")
+            self._audio_pcm_path = os.path.join(self.output_dir, f"audio_{safe_suffix}.pcm")
+            self._audio_wav_path = os.path.join(self.output_dir, f"audio_{safe_suffix}.wav")
+            self._final_mp4_path = os.path.join(self.output_dir, f"final_{safe_suffix}.mp4")
+            # Cleanup existing audio files
+            try:
+                if os.path.exists(self._audio_pcm_path):
+                    os.remove(self._audio_pcm_path)
+                if os.path.exists(self._audio_wav_path):
+                    os.remove(self._audio_wav_path)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Failed to initialize composed output targets: {e}")
         
         # Thread pool for green screen processing
         self._green_screen_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="GreenScreen")
@@ -253,9 +284,9 @@ class RapidoMainSystem:
         # Initialize buffering strategy configuration  
         # REALITY-BASED: SyncTalk produces ~23.1 FPS, Frame pacer delivers ~17.7 FPS
         self.buffer_config = {
-            'min_buffer_threshold': 10,    # Smaller buffer - much faster startup
-            'min_buffer_level': 5,         # Very low threshold - we'll duplicate frames instead of pausing
-            'refill_target': 10,           # Not used - we don't refill during playback
+            'min_buffer_threshold': 75,    # Wait for 75 frames (~3s at 25fps)
+            'min_buffer_level': 40,        # Keep at least ~1.6s buffered for smoothness
+            'refill_target': 75,           # Align with threshold
             'target_fps': 25.0,            # Target 25 FPS output
             'max_timing_drift': 0.08,      # Max timing drift before reset (2 frame intervals)
             'duplicate_when_empty': True,  # Duplicate last frame instead of pausing - SMOOTH PLAYBACK!
@@ -312,15 +343,15 @@ class RapidoMainSystem:
             else:
                 bg_array = np.array(bg_image.resize((854, 480)))
             
-            # Initialize FastChromaKey with SyncTalk's resized frame size (512x512)
-            # This matches the resize_dims from config
+            # Initialize FastChromaKey with reduced avatar frame size (400x400) for faster compose
+            # This must match the processing resize below
             # Use a beige/cream background that matches the current frame background
-            background_color = np.full((512, 512, 3), [220, 210, 190], dtype=np.uint8)  # Beige background
+            background_color = np.full((400, 400, 3), [220, 210, 190], dtype=np.uint8)  # Beige background
             
             # Use the exact chroma key settings from the alin avatar configuration
             self.chroma_key_processor = FastChromaKey(
-                width=512,  # Match SyncTalk's actual output size after resize
-                height=512, # Match SyncTalk's actual output size after resize
+                width=400,
+                height=400,
                 background=background_color,  # Use beige background to match current frames
                 target_color='#bcfeb6',  # Match SyncTalk server green chroma key color
                 color_threshold=35,      # Match avatar config
@@ -440,6 +471,50 @@ class RapidoMainSystem:
     def cpu_compose(self, avatar_frame, slide_frame):
         """Fallback CPU composition"""
         return cv2.addWeighted(avatar_frame, 0.8, slide_frame, 0.2, 0)
+
+    def _load_presenter_positions(self):
+        """Load presenterConfig map {slide_id: config} from captured document for this job id."""
+        if not self.video_job_id:
+            return
+        try:
+            from pathlib import Path
+            import json
+            document_dir = Path("./captured_documents")
+            pattern = f"document_{self.video_job_id}_*.json"
+            files = list(document_dir.glob(pattern))
+            if not files:
+                return
+            latest = max(files, key=lambda f: f.stat().st_mtime)
+            with latest.open('r', encoding='utf-8') as f:
+                data = json.load(f)
+            # Default canvas size
+            self.doc_canvas_size = (1920, 1080)
+            # Build presenter map
+            slides = data.get('slides', [])
+            for slide in slides:
+                if not isinstance(slide, dict):
+                    continue
+                if slide.get('contentType') != 'canvas':
+                    continue
+                sid = slide.get('id')
+                presenter = slide.get('presenterConfig') or slide.get('defaultPresenterConfig')
+                if sid and presenter and isinstance(presenter, dict):
+                    self.presenter_map[sid] = presenter
+                # Try find canvas dims from background image natural size if present
+                objs = slide.get('objects', [])
+                for obj in objs:
+                    if isinstance(obj, dict) and 'width' in obj and 'height' in obj:
+                        try:
+                            w = int(round(float(obj['width'])))
+                            h = int(round(float(obj['height'])))
+                            if w > 0 and h > 0:
+                                self.doc_canvas_size = (w, h)
+                                break
+                        except Exception:
+                            pass
+            logger.info(f"📍 Presenter map loaded for {len(self.presenter_map)} slides; canvas={self.doc_canvas_size}")
+        except Exception as e:
+            logger.warning(f"Failed loading presenter positions: {e}")
     
     async def connect_to_synctalk(self, avatar_name="enrique_torres", sample_rate=16000):
         """Connect to SyncTalk server using DECOUPLED architecture for maximum performance"""
@@ -602,8 +677,8 @@ class RapidoMainSystem:
             logger.info(f"🎬 Publishing video track to room: {room_name}")
             logger.info(f"🎵 Publishing audio track to room: {room_name}")
             
-            # Create sources
-            self.video_source = rtc.VideoSource(854, 480)
+            # Create sources (720p)
+            self.video_source = rtc.VideoSource(1280, 720)
             self.audio_source = rtc.AudioSource(16000, 1)
             
             # Publish tracks
@@ -789,8 +864,8 @@ class RapidoMainSystem:
             await self.lk_room.connect(LIVEKIT_URL, token)
             logger.info(f"✅ Connected to LiveKit room: {room_name}")
             
-            # Create sources
-            self.video_source = rtc.VideoSource(854, 480)
+            # Create sources (720p)
+            self.video_source = rtc.VideoSource(1280, 720)
             self.audio_source = rtc.AudioSource(16000, 1)
             
             # Publish tracks
@@ -1005,6 +1080,13 @@ class RapidoMainSystem:
         except Exception as e:
             logger.warning(f"⚠️ LiveKit disconnect failed: {e}")
         
+        # Finalize WAV and stitch frames+audio into MP4
+        try:
+            self._finalize_audio_wav(sample_rate=16000)
+            self._stitch_final_video(fps=self.target_video_fps)
+        except Exception as e:
+            logger.error(f"Final stitching failed: {e}")
+
         return True
     
     async def continuous_frame_delivery(self, frame_processor):
@@ -1035,6 +1117,12 @@ class RapidoMainSystem:
                 
                 # Ensure threshold is not higher than the queue size
                 effective_threshold = min(min_buffer_threshold, self.intake_queue.maxsize)
+                # If audio ended, skip prefill and start output immediately
+                if getattr(self, 'tts_streaming_complete', False) and intake_size > 0:
+                    buffer_filled = True
+                    buffer_wait_time = time.time() - buffer_wait_start
+                    logger.info(f"🎬 Audio ended - starting with current buffer {intake_size} after {buffer_wait_time:.1f}s")
+                    break
                 if intake_size >= effective_threshold:
                     buffer_filled = True
                     buffer_wait_time = time.time() - buffer_wait_start
@@ -1092,7 +1180,11 @@ class RapidoMainSystem:
                         self.last_frame_data = frame_data  # Save for potential duplication
                         real_frame_count += 1
                     except asyncio.QueueEmpty:
-                        # Intake empty - duplicate last frame for smooth playback (NO PAUSES!)
+                        # After audio end, DO NOT duplicate; end when intake empties
+                        if getattr(self, 'tts_streaming_complete', False):
+                            logger.info("🎬 Intake empty and audio ended - stopping output")
+                            break
+                        # During audio, duplicate last frame for smooth playback
                         if self.last_frame_data is not None:
                             frame_data = self.last_frame_data.copy()  # Duplicate last frame
                             is_duplicated_frame = True
@@ -1154,8 +1246,8 @@ class RapidoMainSystem:
                                     # Update current slide tracking
                                     self._current_slide_id = incoming_slide_id
                                     self._current_slide_index = incoming_slide_idx
-                                    # Add a small margin and subtract measured navigation delay from previous slide
-                                    margin_frames = 6
+                                    # Minimal margin; subtract measured navigation delay and apply early-advance offset
+                                    margin_frames = 0
                                     lead_frames = 0
                                     try:
                                         if hasattr(self, '_advance_signal_time') and self._advance_signal_time:
@@ -1171,9 +1263,18 @@ class RapidoMainSystem:
                                             logger.info(f"⏱️ Using last nav delay lead={lead_frames} frames")
                                     except Exception:
                                         lead_frames = 0
-                                    # Compute threshold with guard
-                                    base_expected = int(expected_loop or 0) + margin_frames - int(lead_frames)
+                                    # Compute threshold with guard and timing offset
+                                    base_expected = (
+                                        int(expected_loop or 0)
+                                        + int(self.slide_timing_offset_frames)
+                                        + margin_frames
+                                        - int(lead_frames)
+                                    )
                                     self._current_slide_expected = max(1, base_expected)
+                                    logger.info(
+                                        f"🎯 Slide timing: expected_loop={expected_loop}, offset={self.slide_timing_offset_frames}, "
+                                        f"margin={margin_frames}, lead={lead_frames} → threshold={self._current_slide_expected} frames"
+                                    )
                                     # Reset signal time so we don't reuse it
                                     self._advance_signal_time = None
                                 
@@ -1238,26 +1339,99 @@ class RapidoMainSystem:
                         if slide_frame is not None:
                             # FAST COMPOSITION with performance tracking
                             composition_start = time.time()
+                            # Determine presenter-based absolute position and fixed size if available
+                            abs_pos = None
+                            fixed_sz = None
+                            try:
+                                current_slide_id = getattr(self, '_current_slide_id', None)
+                                presenter = self.presenter_map.get(current_slide_id) if current_slide_id else None
+                                # Output size from slide_frame
+                                if isinstance(slide_frame, Image.Image):
+                                    out_w, out_h = slide_frame.size
+                                else:
+                                    out_w, out_h = (1280, 720)
+                                canvas_w, canvas_h = self.doc_canvas_size
+                                # Default: 400x400 at 1080p → scale with output height relative to canvas
+                                base_avatar_px = 400
+                                scale_ratio = (out_h / float(canvas_h)) if canvas_h else (720.0 / 1080.0)
+                                target_edge = max(50, int(round(base_avatar_px * scale_ratio)))
+                                fixed_sz = (target_edge, target_edge)
+                                if presenter:
+                                    left = float(presenter.get('left', 0))
+                                    top = float(presenter.get('top', 0))
+                                    # Map to output coordinates
+                                    x_px = int(left / max(1.0, canvas_w) * out_w)
+                                    y_px = int(top / max(1.0, canvas_h) * out_h)
+                                    # Nudge downward slightly (scaled to output height)
+                                    y_nudge = int(round(24 * (out_h / 720.0)))
+                                    y_px = y_px + y_nudge
+                                    abs_pos = (x_px, y_px)
+                                else:
+                                    abs_pos = None
+                            except Exception:
+                                abs_pos = None
+                                fixed_sz = None
+
+                            # Clamp absolute position to keep avatar within bounds if we have both abs_pos and fixed size
+                            if abs_pos and fixed_sz and isinstance(slide_frame, Image.Image):
+                                out_w, out_h = slide_frame.size
+                                ax, ay = abs_pos
+                                fw, fh = fixed_sz
+                                ax = max(0, min(ax, max(0, out_w - fw)))
+                                ay = max(0, min(ay, max(0, out_h - fh)))
+                                abs_pos = (ax, ay)
+
                             composed_frame = frame_processor.overlay_avatar_on_slide(
                                 slide_frame=slide_frame,
                                 avatar_frame=frame,
                                 position="center-bottom",
-                                scale=0.6,
-                                offset=(0, 0)  # No offset needed - center-bottom handles positioning
+                                scale=0.85,
+                                offset=(0, 0),
+                                fixed_size=fixed_sz,
+                                absolute_position=abs_pos
                             )
                             composition_duration = (time.time() - composition_start) * 1000
                             
-                            # Convert audio for LiveKit
+                            # Convert audio for LiveKit and append to PCM archive
                             pcm_audio = audio if isinstance(audio, bytes) else (audio * 32767).astype('int16').tobytes()
+                            try:
+                                if self._audio_pcm_path:
+                                    with open(self._audio_pcm_path, 'ab') as f_pcm:
+                                        f_pcm.write(pcm_audio)
+                            except Exception as e:
+                                logger.debug(f"Failed to append PCM audio: {e}")
                             
                             # Track slow operations
                             max_composition_ms = self.buffer_config['max_composition_time_ms']
                             if composition_duration > max_composition_ms:
                                 logger.warning(f"🐌 Slow composition: {composition_duration:.1f}ms (target: <{max_composition_ms}ms)")
                             
+                            # Convert composed PIL image to BGR for saving/publishing
+                            cv_frame = cv2.cvtColor(np.array(composed_frame), cv2.COLOR_RGB2BGR)
+
+                            # Ensure composed frames directory exists
+                            try:
+                                if self._composed_frames_dir and not os.path.exists(self._composed_frames_dir):
+                                    os.makedirs(self._composed_frames_dir, exist_ok=True)
+                                    logger.info(f"💾 Composed frames directory: {self._composed_frames_dir}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ Failed to create composed frames directory: {e}")
+
+                            # Save composed frame to disk
+                            try:
+                                if self._composed_frames_dir:
+                                    frame_path = os.path.join(
+                                        self._composed_frames_dir,
+                                        f"frame_{self._composed_frame_index:06d}.jpg"
+                                    )
+                                    # Save as JPEG to reduce size; cv_frame is BGR
+                                    cv2.imwrite(frame_path, cv_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                                    self._composed_frame_index += 1
+                            except Exception as e:
+                                logger.debug(f"Failed to save composed frame: {e}")
+
                             # Publish to LiveKit at precise timing with performance measurement
                             publish_start = time.time()
-                            cv_frame = cv2.cvtColor(np.array(composed_frame), cv2.COLOR_RGB2BGR)
                             # Initialize video writer on first frame
                             if self._video_writer is None:
                                 try:
@@ -1512,6 +1686,51 @@ class RapidoMainSystem:
         # FORCE LEGACY MODE - Disable all optimizations for smooth streaming
         # The optimized path was causing InvalidState errors and slow performance
         return await self._publish_frame_to_livekit_legacy(frame, audio_chunk)
+
+    def _finalize_audio_wav(self, sample_rate: int = 16000):
+        """Convert concatenated PCM to WAV."""
+        try:
+            import wave, os
+            if not self._audio_pcm_path or not os.path.exists(self._audio_pcm_path):
+                return
+            with open(self._audio_pcm_path, 'rb') as f_in:
+                pcm_bytes = f_in.read()
+            with wave.open(self._audio_wav_path, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(pcm_bytes)
+            logger.info(f"🎵 Final WAV written: {self._audio_wav_path}")
+        except Exception as e:
+            logger.error(f"Failed to finalize WAV: {e}")
+
+    def _stitch_final_video(self, fps: float):
+        """Use ffmpeg to stitch frames and WAV into MP4."""
+        try:
+            import subprocess, os
+            if not self._composed_frames_dir or not os.path.isdir(self._composed_frames_dir):
+                logger.warning("No composed frames to stitch")
+                return
+            if not self._audio_wav_path or not os.path.exists(self._audio_wav_path):
+                logger.warning("No WAV audio to stitch")
+                return
+            pattern = os.path.join(self._composed_frames_dir, 'frame_%06d.jpg')
+            cmd = [
+                'ffmpeg', '-y',
+                '-framerate', f'{fps}',
+                '-i', pattern,
+                '-i', self._audio_wav_path,
+                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '192k',
+                '-shortest', self._final_mp4_path
+            ]
+            logger.info(f"🎞️ ffmpeg stitching → {self._final_mp4_path}")
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            logger.info(f"✅ Final MP4 ready: {self._final_mp4_path}")
+        except FileNotFoundError:
+            logger.error("ffmpeg not found. Install ffmpeg to enable stitching.")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"ffmpeg failed: {e}")
     
     async def publish_frame_to_livekit_optimized(self, composed_frame, audio_chunk):
         """Optimized frame and audio publishing with buffering"""
@@ -1698,14 +1917,14 @@ class RapidoMainSystem:
                     
                     avatar_frame = Image.fromarray(frame_array, 'RGB')
                     
-                    # Upscale ALL smaller frames to 512x512 for consistent processing and quality
+                    # Upscale ALL smaller frames to 400x400 for consistent processing and quality
                     original_size = frame_array.shape[:2]
-                    if original_size != (512, 512):
-                        avatar_frame = avatar_frame.resize((512, 512), Image.LANCZOS)
+                    if original_size != (400, 400):
+                        avatar_frame = avatar_frame.resize((400, 400), Image.LANCZOS)
                         if self._frame_count < 3:
-                            logger.info(f"🔍 Upscaling {original_size[0]}x{original_size[1]} → 512x512 using LANCZOS interpolation")
+                            logger.info(f"🔍 Upscaling {original_size[0]}x{original_size[1]} → 400x400 using LANCZOS interpolation")
                     elif self._frame_count < 3:
-                        logger.info(f"🔍 Frame already 512x512, no upscaling needed")
+                        logger.info(f"🔍 Frame already 400x400, no upscaling needed")
                     
                     # Apply green screen removal for transparency (async for better performance)
                     try:

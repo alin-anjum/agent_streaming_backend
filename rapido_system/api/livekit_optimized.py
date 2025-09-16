@@ -102,7 +102,7 @@ class LiveKitOptimizedPublisher:
         self.audio_publication: Optional[rtc.LocalTrackPublication] = None
         
         # Frame buffer for consistent delivery
-        self.frame_buffer = collections.deque(maxlen=10)  # ~400ms at 25fps
+        self.frame_buffer = collections.deque(maxlen=75)  # ~3s at 25fps
         self.frame_pacer_task: Optional[asyncio.Task] = None
         
         # Audio jitter buffer
@@ -361,8 +361,8 @@ class LiveKitOptimizedPublisher:
             'timestamp': time.time()
         })
         
-        # Drop old frames if buffer is full
-        while len(self.frame_buffer) > 8:  # Keep max 8 frames
+        # Drop old frames if buffer is far beyond capacity (keep headroom)
+        while len(self.frame_buffer) > 70:  # Keep ~70/75 frames, drop oldest
             dropped = self.frame_buffer.popleft()
             self.stats['frames_dropped'] += 1
     
