@@ -50,7 +50,25 @@ async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: as
         # Start the long-running capture task in background (non-blocking)
         async def background_capture():
             try:
-                await browser_service.capture_frames_live_to_queue(duration_seconds or 300, frame_queue)
+                # Prefer per-slide first-frame capture if parsed slide data exists
+                use_per_slide = False
+                if video_job_id:
+                    from pathlib import Path
+                    import time as _time
+                    rapido_system_dir = Path(__file__).resolve().parents[2]
+                    parsed_path = rapido_system_dir / "data" / "parsed_slideData" / f"{video_job_id}.json"
+                    # Wait briefly for parsed slide data to be created by upstream fetch
+                    wait_start = _time.time()
+                    while not parsed_path.exists() and (_time.time() - wait_start) < 5.0:
+                        await asyncio.sleep(0.2)
+                    use_per_slide = parsed_path.exists()
+                
+                if use_per_slide:
+                    logger.info("🧩 Using per-slide first-frame capture based on parsed_slideData")
+                    await browser_service.capture_first_frames_per_slide_to_queue(frame_queue)
+                else:
+                    logger.info("🎥 Using continuous live capture to queue (no parsed slide data found)")
+                    await browser_service.capture_frames_live_to_queue(duration_seconds or 300, frame_queue)
             finally:
                 await browser_service.cleanup()
         

@@ -142,6 +142,20 @@ class BrowserAutomationService:
             
             captured_doc = None
             if video_job_id and not is_slide_specific_url:
+                # If parsed slide data already exists, skip document capture
+                try:
+                    rapido_system_dir = Path(__file__).resolve().parents[2]
+                    parsed_path = rapido_system_dir / "data" / "parsed_slideData" / f"{video_job_id}.json"
+                    if parsed_path.exists():
+                        logger.info(f"🧩 Parsed slide data already present at {parsed_path} - skipping network document capture")
+                        await self.page.goto(self.config.capture_url, wait_until="networkidle", timeout=30000)
+                        logger.info("✅ Page loaded successfully")
+                        await asyncio.sleep(2)
+                        logger.info("🎯 Ready for frame capture")
+                        return True
+                except Exception as e:
+                    logger.debug(f"Parsed slide data check failed: {e}")
+
                 logger.info(f"📄 Starting network monitoring BEFORE navigation for video job ID: {video_job_id}")
                 
                 # Start monitoring before navigation
@@ -212,6 +226,175 @@ class BrowserAutomationService:
                 
         except Exception as e:
             logger.error(f"❌ Live frame capture to queue failed: {e}")
+            raise
+
+    async def capture_first_frames_per_slide_to_queue(self, frame_queue: "asyncio.Queue"):
+        """Navigate slide-by-slide and enqueue only the first frame per slide, sleeping per slide duration.
+
+        This uses parsed slide data at rapido_system/data/parsed_slideData/{video_job_id}.json
+        and constructs URLs of the form base/video-capture/{job_id}?slideId={slide_id}.
+        The consumer will duplicate the last frame between updates.
+        """
+        try:
+            if not self.video_job_id:
+                raise Exception("video_job_id is required for per-slide capture")
+
+            # Load parsed slide data
+            rapido_system_dir = Path(__file__).resolve().parents[2]
+            parsed_path = rapido_system_dir / "data" / "parsed_slideData" / f"{self.video_job_id}.json"
+            if not parsed_path.exists():
+                raise FileNotFoundError(f"Parsed slide data not found: {parsed_path}")
+
+            with parsed_path.open("r", encoding="utf-8") as f:
+                parsed_data = json.load(f)
+
+            slides = []
+            for entry in (parsed_data.get("slides") or []):
+                info = entry.get("slideInfo") or {}
+                # Only consider canvas slides with slideId
+                if (info.get("slideType") == 1) and info.get("slideId"):
+                    slides.append({
+                        "slide_id": info.get("slideId"),
+                        "duration_ms": info.get("narrationDuration") or 0
+                    })
+
+            if not slides:
+                raise Exception("No canvas slides with slideId found in parsed slide data")
+
+            # Derive base URL for /video-capture from configured capture_url
+            capture_url = self.config.capture_url or ""
+            base_prefix = "/video-capture/"
+            if base_prefix in capture_url:
+                base_url = capture_url.split(base_prefix)[0] + base_prefix.rstrip("/")
+            else:
+                # Fallback: use full URL up to path part, then append /video-capture
+                from urllib.parse import urlparse
+                parsed = urlparse(capture_url)
+                base_url = f"{parsed.scheme}://{parsed.netloc}/video-capture"
+
+            logger.info(f"🌐 Using base capture URL: {base_url}")
+
+            # Prepare CDP session once and reuse
+            cdp_session = None
+            try:
+                cdp_session = await self.page.context.new_cdp_session(self.page)
+                logger.info("📹 CDP session established for first-frame capture")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not establish CDP session: {e}")
+
+            # Global index increments per slide (consumer logs use this)
+            global_index = 0
+
+            # Iterate slides in order
+            for idx, slide in enumerate(slides, start=1):
+                slide_id = slide["slide_id"]
+                duration_ms = slide["duration_ms"] if isinstance(slide["duration_ms"], (int, float)) else 0
+                duration_sec = max(0.0, float(duration_ms) / 1000.0)
+
+                slide_url = f"{base_url}/{self.video_job_id}?slideId={slide_id}"
+                logger.info(f"➡️ Navigating to slide {idx}/{len(slides)}: {slide_url}")
+
+                # Navigate to slide and wait for network idle
+                await self.page.goto(slide_url, wait_until="networkidle", timeout=30000)
+                await asyncio.sleep(0.25)
+
+                # Install hooks to catch canvas frame if available
+                try:
+                    await self._setup_slide_capture_hooks()
+                except Exception as e:
+                    logger.debug(f"Hook setup failed (continuing with CDP fallback): {e}")
+
+                # Click play button (best-effort)
+                try:
+                    play_button_selectors = [
+                        'button[class*="play"]',
+                        'button[aria-label*="play" i]',
+                        'button[title*="play" i]',
+                        'button:has-text("Play")',
+                        'button:has-text("▶")',
+                        '.play-button',
+                        '[data-testid*="play"]',
+                        'input[type="button"][value*="play" i]'
+                    ]
+                    for selector in play_button_selectors:
+                        try:
+                            await self.page.wait_for_selector(selector, timeout=1000)
+                            await self.page.evaluate(
+                                f"""
+                                () => {{
+                                    const button = document.querySelector('{selector}');
+                                    if (button) {{ button.click(); return true; }}
+                                    return false;
+                                }}
+                                """
+                            )
+                            logger.info(f"▶️ Play clicked using selector: {selector}")
+                            break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    logger.debug(f"Play click attempt failed: {e}")
+
+                # Try to get the very first canvas frame if present; otherwise CDP screenshot
+                frame_image = None
+                try:
+                    # Briefly poll for a canvas frame
+                    poll_start = time.time()
+                    while time.time() - poll_start < 1.5:
+                        buffer_status = await self.page.evaluate("""
+                            () => ({ bufferSize: window.bufferSize || 0 })
+                        """)
+                        if (buffer_status or {}).get('bufferSize', 0) > 0:
+                            frame_data = await self.page.evaluate("""
+                                () => (window.frameBuffer && window.frameBuffer[0]) ? window.frameBuffer[0] : null
+                            """)
+                            if isinstance(frame_data, str) and frame_data.startswith('data:image/png;base64,'):
+                                image_bytes = base64.b64decode(frame_data.split(',')[1])
+                                from PIL import Image
+                                import io
+                                frame_image = Image.open(io.BytesIO(image_bytes)).resize((854, 480))
+                                break
+                        await asyncio.sleep(0.05)
+                except Exception as e:
+                    logger.debug(f"Canvas first-frame polling failed: {e}")
+
+                # Fallback to CDP screenshot
+                if frame_image is None and cdp_session is not None:
+                    try:
+                        await asyncio.sleep(0.2)  # give a moment after play for UI to update
+                        result = await cdp_session.send("Page.captureScreenshot", {"format": "png", "quality": 90})
+                        if result and 'data' in result:
+                            image_bytes = base64.b64decode(result['data'])
+                            from PIL import Image
+                            import io
+                            frame_image = Image.open(io.BytesIO(image_bytes)).resize((854, 480))
+                    except Exception as e:
+                        logger.debug(f"CDP screenshot failed: {e}")
+
+                if frame_image is None:
+                    logger.warning(f"⚠️ Could not capture first frame for slide {slide_id}; skipping enqueue")
+                else:
+                    # Enqueue one frame for this slide
+                    try:
+                        frame_queue.put_nowait((global_index, frame_image))
+                        logger.info(f"📥 Enqueued first frame for slide {idx} (id={slide_id}) as index {global_index}")
+                        global_index += 1
+                    except Exception as e:
+                        logger.warning(f"Queue operation failed for slide {slide_id}: {e}")
+
+                # Sleep for slide duration so consumer duplicates frame during this interval
+                sleep_seconds = duration_sec if duration_sec > 0 else 4.0
+                logger.info(f"⏳ Holding slide {idx} frame for {sleep_seconds:.2f}s before next slide")
+                try:
+                    await asyncio.sleep(sleep_seconds)
+                except asyncio.CancelledError:
+                    logger.info("⛔ Per-slide capture cancelled")
+                    break
+
+            logger.info("✅ Per-slide first-frame capture completed for all slides")
+
+        except Exception as e:
+            logger.error(f"❌ Per-slide first-frame capture failed: {e}")
             raise
 
     async def capture_frames_live_to_directory(self, duration_seconds: int, target_directory: str):
