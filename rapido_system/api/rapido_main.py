@@ -38,6 +38,7 @@ except ImportError:
 from PIL import Image
 import io
 import time
+import uuid
 from pathlib import Path
 import argparse
 import requests
@@ -221,6 +222,172 @@ class RapidoMainSystem:
             self.total_slide_frames = self.frame_processor.get_frame_count()
         self.total_duration_seconds = self.total_slide_frames / self.synctalk_fps
         # Try to load presenter positions from captured document
+
+        # Embed/pause control state
+        self.paused_for_embed = False
+        self.timeline_slides = []
+        self._timeline_index_by_canvas = {}
+        self._deferred_advance = False
+        self._load_presentation_timeline()
+        self._initial_embed_checked = False
+
+        # LiveKit track publish gating: only publish after buffer prefill
+        self._tracks_published = False
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
+    async def _publish_control_event(self, payload: dict):
+        """Send a control message over LiveKit data channel (topic 'control')."""
+        try:
+            import livekit.rtc as rtc
+            if getattr(self, 'lk_room', None) and self.lk_room.local_participant:
+                data = json.dumps(payload).encode('utf-8')
+                await self.lk_room.local_participant.publish_data(
+                    data,
+                    rtc.DataPacketKind.RELIABLE,
+                    topic='control'
+                )
+        except Exception as e:
+            logger.warning(f"Control publish failed: {e}")
+
+    async def send_show_embed(self, slide_id: str):
+        await self._publish_control_event({
+            'id': str(uuid.uuid4()),
+            'message': 'showEmbed',
+            'timestamp': self._now_ms(),
+            'slideId': slide_id,
+        })
+
+    async def send_resume_stream(self):
+        await self._publish_control_event({
+            'id': str(uuid.uuid4()),
+            'message': 'resumeStream',
+            'timestamp': self._now_ms(),
+        })
+
+    async def send_stream_event_to_frontend(self, event_type: str, **kwargs):
+        """Map to StreamEndEvent on completion to notify frontend UI."""
+        if event_type == 'stream_ended':
+            await self._publish_control_event({
+                'id': str(uuid.uuid4()),
+                'message': 'streamEnd',
+                'timestamp': self._now_ms(),
+            })
+
+    async def _pause_for_embed(self, embed_id: str):
+        """Pause LiveKit publishing and instruct frontend to show embed."""
+        if self.paused_for_embed:
+            return
+        self.paused_for_embed = True
+        logger.info(f"⏸️ Pausing publishing for embed: {embed_id}")
+        # Drain any buffered frames to stop pending publishing
+        try:
+            await self._drain_queues_for_pause()
+        except Exception as _:
+            pass
+        await self.send_show_embed(embed_id)
+
+    async def _resume_from_embed(self):
+        """Resume LiveKit publishing and advance slides if a defer was pending."""
+        if not self.paused_for_embed:
+            return
+        self.paused_for_embed = False
+        logger.info("▶️ Resuming publishing after embed")
+        await self.send_resume_stream()
+        # If there are consecutive embeds after current canvas, immediately pause again
+        try:
+            embed_next = self._next_embed_after_current()
+        except Exception:
+            embed_next = None
+        if embed_next:
+            await self._pause_for_embed(embed_next)
+            # keep _deferred_advance True for when embed chain ends
+            return
+        # Otherwise, if we deferred a slide advance while pausing, trigger it now
+        if self._deferred_advance and self.slide_control_queue is not None:
+            try:
+                self.slide_control_queue.put_nowait("advance")
+            except Exception:
+                pass
+            self._deferred_advance = False
+
+    def _next_embed_after_current(self) -> Optional[str]:
+        """If the next timeline item after current canvas is an embed, return its id."""
+        try:
+            current_id = getattr(self, '_current_slide_id', None)
+            if not current_id or not self.timeline_slides:
+                return None
+            idx = self._timeline_index_by_canvas.get(current_id)
+            if idx is None:
+                return None
+            if idx + 1 < len(self.timeline_slides):
+                nxt = self.timeline_slides[idx + 1]
+                if nxt.get('type') == 'embed':
+                    return nxt.get('id')
+            return None
+        except Exception:
+            return None
+
+    async def _drain_queues_for_pause(self):
+        """Drop any queued frames so no stale frames get published after pause.
+        Also prevents memory growth while waiting on embed UI."""
+        drained_avatar = 0
+        drained_slide = 0
+        try:
+            # Drain avatar frame intake queue
+            if hasattr(self, 'intake_queue') and self.intake_queue is not None:
+                while True:
+                    try:
+                        _ = self.intake_queue.get_nowait()
+                        drained_avatar += 1
+                    except asyncio.QueueEmpty:
+                        break
+                # Avoid duplicating stale last frame during pause
+                self.last_frame_data = None
+        except Exception:
+            pass
+        try:
+            # Drain slide frames if any
+            if self.slide_frame_queue is not None:
+                while True:
+                    try:
+                        _ = self.slide_frame_queue.get_nowait()
+                        drained_slide += 1
+                    except asyncio.QueueEmpty:
+                        break
+        except Exception:
+            pass
+        if drained_avatar or drained_slide:
+            logger.info(f"🧺 Drained queues on pause - avatar={drained_avatar}, slide={drained_slide}")
+
+    def _load_presentation_timeline(self):
+        """Build ordered timeline from parsed_slideData with canvas and embed entries."""
+        try:
+            if not self.video_job_id:
+                return
+            parsed_path = Path(f"./rapido_system/data/parsed_slideData/{self.video_job_id}.json")
+            if not parsed_path.exists():
+                logger.info(f"No parsed_slideData found at {parsed_path}; timeline will be empty")
+                return
+            with parsed_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            timeline = []
+            for entry in (data.get("slides") or []):
+                info = entry.get("slideInfo") or {}
+                slide_type = info.get("slideType")
+                if slide_type == 1 and info.get("slideId"):
+                    timeline.append({"type": "canvas", "id": info["slideId"]})
+                elif slide_type == 2 and info.get("embedId"):
+                    timeline.append({"type": "embed", "id": info["embedId"]})
+            self.timeline_slides = timeline
+            self._timeline_index_by_canvas = {
+                it["id"]: i for i, it in enumerate(timeline) if it.get("type") == "canvas"
+            }
+            if timeline:
+                logger.info(f"📜 Loaded timeline with {len(timeline)} items (canvas+embed)")
+        except Exception as e:
+            logger.warning(f"Failed to load presentation timeline: {e}")
         try:
             self._load_presenter_positions()
         except Exception as e:
@@ -830,6 +997,7 @@ class RapidoMainSystem:
             import livekit.rtc as rtc
             import jwt
             import time
+            import uuid
             
             # LiveKit credentials
             LIVEKIT_URL = "wss://agent-staging-2y5e52au.livekit.cloud"
@@ -878,6 +1046,22 @@ class RapidoMainSystem:
             self.audio_publication = await self.lk_room.local_participant.publish_track(audio_track, audio_options)
             
             logger.info("✅ Connected to LiveKit (legacy mode)!")
+            # Bind control data reception if available
+            try:
+                @self.lk_room.on("data_received")
+                def _on_data_received(data, participant, kind, topic: str):
+                    try:
+                        if topic != "control":
+                            return
+                        raw = data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else str(data)
+                        evt = json.loads(raw)
+                        msg = (evt or {}).get("message")
+                        if msg in ("resumeStream", "goLive"):
+                            asyncio.create_task(self._resume_from_embed())
+                    except Exception as ee:
+                        logger.debug(f"control data parsing failed: {ee}")
+            except Exception as e:
+                logger.warning(f"LiveKit data event binding not available: {e}")
             return True
             
         except Exception as e:
@@ -1094,6 +1278,19 @@ class RapidoMainSystem:
         try:
             slide_frame_index = 0
             frame_count = 0
+            # If timeline starts with embeds (or multiple embeds), pause immediately before first output
+            if not getattr(self, '_initial_embed_checked', False):
+                try:
+                    # When no current slide yet, we look at the first timeline item
+                    if self.timeline_slides:
+                        # If first item(s) are embeds, pause and show the first embed
+                        first = self.timeline_slides[0]
+                        if first.get('type') == 'embed':
+                            await self._pause_for_embed(first.get('id'))
+                            self._deferred_advance = True
+                except Exception:
+                    pass
+                self._initial_embed_checked = True
             
             # Buffering configuration - use configurable values
             min_buffer_threshold = self.buffer_config['min_buffer_threshold']
@@ -1286,12 +1483,22 @@ class RapidoMainSystem:
                                         if hasattr(self, '_current_slide_expected') and isinstance(self._current_slide_expected, int) and self._current_slide_expected > 0:
                                             if self._current_slide_frame_loops >= self._current_slide_expected:
                                                 if self.slide_control_queue is not None:
-                                                    # Record signal time to measure navigation latency
-                                                    self._advance_signal_time = time.time()
-                                                    self.slide_control_queue.put_nowait("advance")
-                                                    logger.info(f"➡️ Signaled advance after {self._current_slide_frame_loops} frames (threshold {self._current_slide_expected}) for slide {self._current_slide_index} ({self._current_slide_id})")
-                                                    # Set expected to None to avoid repeated signals for this slide
-                                                    self._current_slide_expected = None
+                                                    try:
+                                                        embed_id = self._next_embed_after_current()
+                                                    except Exception:
+                                                        embed_id = None
+                                                    if embed_id:
+                                                        # Pause and show embed; defer advance until resume
+                                                        await self._pause_for_embed(embed_id)
+                                                        self._deferred_advance = True
+                                                        self._current_slide_expected = None
+                                                    else:
+                                                        # Record signal time to measure navigation latency
+                                                        self._advance_signal_time = time.time()
+                                                        self.slide_control_queue.put_nowait("advance")
+                                                        logger.info(f"➡️ Signaled advance after {self._current_slide_frame_loops} frames (threshold {self._current_slide_expected}) for slide {self._current_slide_index} ({self._current_slide_id})")
+                                                        # Set expected to None to avoid repeated signals for this slide
+                                                        self._current_slide_expected = None
                                     except Exception:
                                         pass
                                 
@@ -1315,10 +1522,19 @@ class RapidoMainSystem:
                                         if hasattr(self, '_current_slide_expected') and isinstance(self._current_slide_expected, int) and self._current_slide_expected > 0:
                                             if self._current_slide_frame_loops >= self._current_slide_expected:
                                                 if self.slide_control_queue is not None:
-                                                    self._advance_signal_time = time.time()
-                                                    self.slide_control_queue.put_nowait("advance")
-                                                    logger.info(f"➡️ Signaled advance after {self._current_slide_frame_loops} frames (threshold {self._current_slide_expected}) for slide {self._current_slide_index} ({self._current_slide_id}) [duplicate]")
-                                                    self._current_slide_expected = None
+                                                    try:
+                                                        embed_id = self._next_embed_after_current()
+                                                    except Exception:
+                                                        embed_id = None
+                                                    if embed_id:
+                                                        await self._pause_for_embed(embed_id)
+                                                        self._deferred_advance = True
+                                                        self._current_slide_expected = None
+                                                    else:
+                                                        self._advance_signal_time = time.time()
+                                                        self.slide_control_queue.put_nowait("advance")
+                                                        logger.info(f"➡️ Signaled advance after {self._current_slide_frame_loops} frames (threshold {self._current_slide_expected}) for slide {self._current_slide_index} ({self._current_slide_id}) [duplicate]")
+                                                        self._current_slide_expected = None
                                     except Exception:
                                         pass
                                 if slide_frame_index % 25 == 0:  # Debug every second
@@ -1454,7 +1670,26 @@ class RapidoMainSystem:
                                     self._video_writer.write(cv_frame)
                             except Exception as e:
                                 logger.warning(f"⚠️ Video write failed: {e}")
-                            await self.publish_frame_to_livekit(cv_frame, pcm_audio)
+                            # Skip publishing during embed pause; also discard any intake/slide frames during pause
+                            if getattr(self, 'paused_for_embed', False):
+                                # While paused, do not publish and do not retain last_frame_data
+                                self.last_frame_data = None
+                                # Best-effort drain slide queue quickly to prevent growth
+                                try:
+                                    if self.slide_frame_queue is not None:
+                                        drained = 0
+                                        while True:
+                                            try:
+                                                _ = self.slide_frame_queue.get_nowait()
+                                                drained += 1
+                                            except asyncio.QueueEmpty:
+                                                break
+                                        if drained:
+                                            logger.debug(f"Slide queue drained during pause: {drained}")
+                                except Exception:
+                                    pass
+                            else:
+                                await self.publish_frame_to_livekit(cv_frame, pcm_audio)
                             publish_duration = (time.time() - publish_start) * 1000  # Convert to milliseconds
                             
                             # Track publishing performance
