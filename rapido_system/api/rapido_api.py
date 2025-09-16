@@ -488,7 +488,16 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         # 3) Final fallback
         if not actual_narration or not actual_narration.strip():
             logger.error(f"No narration found for job {video_job_id}; using fallback message")
-            actual_narration = "No narration content available for this presentation."
+            # Use longer fallback text to generate enough frames for buffer threshold
+            actual_narration = """
+            Hello and welcome to this presentation. This is a test narration that will generate 
+            enough audio content to fill the frame buffer and demonstrate the avatar system working correctly. 
+            The system requires at least 75 frames, which is about 3 seconds of content at 25 frames per second, 
+            to fill the initial buffer before starting the steady output. This longer narration should provide 
+            sufficient content for the system to work properly and demonstrate all the features including 
+            the dynamic frame capture, audio processing, and real-time avatar generation capabilities.
+            Thank you for watching this demonstration of the avatar presentation system.
+            """
         
         success = await rapido.stream_real_time_tts(actual_narration)
         
@@ -516,6 +525,18 @@ async def auto_start_presentation(room_name: str, lesson_id: str, video_job_id: 
         if session_id in active_sessions:
             active_sessions[session_id]["status"] = "error"
             active_sessions[session_id]["error"] = str(e)
+            
+            # Send stream stopped event to frontend on error
+            if hasattr(rapido, 'send_stream_event_to_frontend'):
+                try:
+                    await rapido.send_stream_event_to_frontend(
+                        "stream_stopped",
+                        message=f"Avatar presentation stopped due to error: {str(e)}",
+                        lesson_id=lesson_id,
+                        video_job_id=video_job_id
+                    )
+                except Exception as event_error:
+                    logger.error(f"Failed to send stream_stopped event: {event_error}")
             
     finally:
         # Clean up room registration when avatar finishes
@@ -576,6 +597,16 @@ async def start_rapido_session(session_id: str, narration_text: str, avatar_name
         if success:
             session["status"] = "complete"
             logger.info(f"✅ Presentation completed: {session_id}")
+            
+            # Send stream ended event to frontend
+            if hasattr(rapido, 'send_stream_event_to_frontend'):
+                try:
+                    await rapido.send_stream_event_to_frontend(
+                        "stream_ended",
+                        message="Avatar presentation has completed successfully"
+                    )
+                except Exception as event_error:
+                    logger.error(f"Failed to send stream_ended event: {event_error}")
         else:
             raise Exception("Streaming failed")
             
@@ -583,6 +614,16 @@ async def start_rapido_session(session_id: str, narration_text: str, avatar_name
         logger.error(f"❌ Session {session_id} failed: {e}")
         session["status"] = "error"
         session["error"] = str(e)
+        
+        # Send stream stopped event to frontend on error
+        if session.get("rapido_system") and hasattr(session["rapido_system"], 'send_stream_event_to_frontend'):
+            try:
+                await session["rapido_system"].send_stream_event_to_frontend(
+                    "stream_stopped",
+                    message=f"Avatar presentation stopped due to error: {str(e)}"
+                )
+            except Exception as event_error:
+                logger.error(f"Failed to send stream_stopped event: {event_error}")
         
     finally:
         # Cleanup connections

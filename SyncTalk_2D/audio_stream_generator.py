@@ -55,6 +55,10 @@ class AudioStreamGenerator:
         self.silence_chunk_duration = 0.15  # 150ms chunks for better responsiveness
         self.silence_backlog = 0.0  # Track how much silence we owe
         
+        # NEW: Track stream end state to stop silence generation
+        self.stream_ended = False  # Track if end_of_stream received
+        self.end_marker_processed = False  # Track if we've processed the end marker
+        
     async def add_audio_chunk_async(self, audio_chunk: bytes):
         """Add new audio chunk from websocket (with async resampling if needed)"""
         with self._lock:
@@ -62,6 +66,10 @@ class AudioStreamGenerator:
                 # Handle special stream markers
                 if audio_chunk in ALL_MARKERS:
                     self.audio_queue.put(audio_chunk)
+                    # NEW: Mark stream as ended when end_of_stream received
+                    if audio_chunk in END_MARKERS:
+                        self.stream_ended = True
+                        logger.info("🔚 End of stream marker received - stopping silence generation")
                     return
                 
                 # Resample audio asynchronously if necessary
@@ -80,6 +88,10 @@ class AudioStreamGenerator:
                 # Handle special stream markers
                 if audio_chunk in ALL_MARKERS:
                     self.audio_queue.put(audio_chunk)
+                    # NEW: Mark stream as ended when end_of_stream received
+                    if audio_chunk in END_MARKERS:
+                        self.stream_ended = True
+                        logger.info("🔚 End of stream marker received - stopping silence generation")
                     return
                 
                 # Resample audio if necessary (blocking version)
@@ -172,6 +184,16 @@ class AudioStreamGenerator:
             if chunk is None:  # Sentinel value
                 raise StopIteration
             
+            # NEW: Handle end marker and stop iteration
+            if isinstance(chunk, bytes) and chunk in END_MARKERS:
+                if not self.end_marker_processed:
+                    self.end_marker_processed = True
+                    logger.info("🔚 Processing end_of_stream marker - will stop iteration after this")
+                    return chunk  # Return the marker once
+                else:
+                    logger.info("🔚 End marker already processed - stopping iteration")
+                    raise StopIteration
+            
             logger.info(f"AudioStreamGenerator: Got audio chunk of {len(chunk)} bytes")
             # Reset silence tracking when we get real audio
             self.silence_backlog = 0.0
@@ -180,6 +202,11 @@ class AudioStreamGenerator:
         except queue.Empty:
             with self._lock:
                 if not self.is_active:
+                    raise StopIteration
+                
+                # NEW: Don't generate silence if stream has ended
+                if self.stream_ended:
+                    logger.info("🔚 Stream ended - stopping iteration (no more silence generation)")
                     raise StopIteration
             
             # Log "returning None" only every 100 times

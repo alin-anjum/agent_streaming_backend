@@ -53,7 +53,16 @@ api_dir = current_dir
 rapido_system_root = os.path.dirname(api_dir)
 project_root = os.path.dirname(rapido_system_root)
 
-# Prefer absolute package imports (avoid sys.path hacks where possible)
+# Add project root to Python path for imports
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+# Add SyncTalk_2D path for protobuf imports
+sync_talk_path = os.path.join(project_root, 'SyncTalk_2D')
+if sync_talk_path not in sys.path:
+    sys.path.append(sync_talk_path)
+
+# Now import with correct paths
 from rapido_system.core.config.config import Config
 from rapido_system.api.data_parser import SlideDataParser
 from rapido_system.api.tts_client import ElevenLabsTTSClient
@@ -78,11 +87,8 @@ except ImportError as e:
     logger.warning(f"⚠️ Optimized modules not available: {e}")
     OPTIMIZATIONS_AVAILABLE = False
 
-# Import SyncTalk protobuf (module lives in SyncTalk_2D)
+# Import SyncTalk protobuf (path already added above)
 try:
-    synctalk_path = os.path.join(project_root, 'SyncTalk_2D')
-    if synctalk_path not in sys.path:
-        sys.path.insert(0, synctalk_path)
     from frame_message_pb2 import FrameMessage
     logger.info("✅ Protobuf integration ready")
 except ImportError as e:
@@ -92,13 +98,6 @@ except ImportError as e:
 
 # Import SyncTalk chroma key for green screen removal
 try:
-    # Add project root to path for SyncTalk_2D import
-    import os
-    import sys
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-    
     from SyncTalk_2D.chroma_key import FastChromaKey
     CHROMA_KEY_AVAILABLE = True
     logger.info("✅ SyncTalk chroma key module imported successfully")
@@ -1142,6 +1141,8 @@ class RapidoMainSystem:
         # Note: For dynamic capture, frames are now fed directly to queue by browser service
         # No separate slide frame producer task needed since browser feeds queue directly
         
+        # Note: stream_started event will be sent when buffer fills (see continuous_frame_delivery)
+        
         # Start real-time streaming
         logger.info("🎭 Starting OPTIMIZED REAL-TIME audio streaming with 160ms chunks...")
         if self.audio_optimizer:
@@ -1154,6 +1155,13 @@ class RapidoMainSystem:
         self.tts_streaming_complete = True
         logger.info(f"🎭 TTS streaming complete. Sent {self.audio_chunks_sent} audio chunks to SyncTalk")
 
+        # Send end_stream message to LiveKit frontend clients FIRST
+        await self.send_stream_event_to_frontend("stream_ending",
+            message="Avatar presentation is ending",
+            total_audio_chunks=self.audio_chunks_sent,
+            duration_seconds=time.time() - getattr(self, 'stream_start_time', time.time())
+        )
+
         # Immediately signal end-of-stream to SyncTalk so it can stop generating new frames
         # and flush remaining frames naturally.
         logger.info("📡 Sending end marker to SyncTalk immediately after TTS completion...")
@@ -1164,38 +1172,50 @@ class RapidoMainSystem:
         except Exception as e:
             logger.warning(f"Failed to queue end marker: {e}")
 
-        # Drain remaining frames until:
-        # 1) No new frames arrive for a short quiet period AND
-        # 2) The intake queue is empty for a short continuous period.
-        # No timeout: fully flush all frames after audio ends.
-        quiet_required_seconds = 1.0
-        empty_required_seconds = 1.0
+        # ENHANCED: More responsive frame draining with shorter timeouts
+        quiet_required_seconds = 0.5  # Reduced from 1.0 for faster response
+        empty_required_seconds = 0.5  # Reduced from 1.0 for faster response
+        check_interval = 0.2  # Reduced from 0.5 for more responsive checking
+        max_drain_time = 10.0  # Maximum time to wait for draining
+        
         last_received_count = self.frames_received
         quiet_elapsed = 0.0
         empty_elapsed = 0.0
-        logger.info("⏳ Draining remaining frames until queue empty and quiet period (no timeout)...")
+        drain_start_time = time.time()
+        
+        logger.info("⏳ Enhanced frame draining - shorter timeouts, more responsive...")
+        
         while True:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(check_interval)
+            
+            # Check for overall timeout
+            if time.time() - drain_start_time > max_drain_time:
+                logger.warning(f"⚠️ Frame draining timeout after {max_drain_time}s - forcing completion")
+                break
+            
             # Check quiet period on incoming frames
             current_received = self.frames_received
             if current_received == last_received_count:
-                quiet_elapsed += 0.5
+                quiet_elapsed += check_interval
             else:
                 quiet_elapsed = 0.0
                 last_received_count = current_received
+            
             # Check output queue emptiness
             qsize = self.intake_queue.qsize()
             if qsize == 0:
-                empty_elapsed += 0.5
+                empty_elapsed += check_interval
             else:
                 empty_elapsed = 0.0
-            # Periodic status
-            if int(time.time()) % 5 == 0:
+            
+            # More frequent status updates for better visibility
+            if int(time.time() * 2) % 5 == 0:  # Every 2.5 seconds
                 logger.info(f"🧺 Drain status: queue={qsize}, quiet={quiet_elapsed:.1f}s, empty={empty_elapsed:.1f}s, received={current_received}")
+            
             # Exit when both conditions satisfied
             if quiet_elapsed >= quiet_required_seconds and empty_elapsed >= empty_required_seconds:
                 logger.info(
-                    f"✅ Drain complete: queue empty ({empty_elapsed:.1f}s) and quiet ({quiet_elapsed:.1f}s). "
+                    f"✅ Enhanced drain complete: queue empty ({empty_elapsed:.1f}s) and quiet ({quiet_elapsed:.1f}s). "
                     f"Total frames received: {current_received}"
                 )
                 break
@@ -1324,6 +1344,14 @@ class RapidoMainSystem:
                     buffer_filled = True
                     buffer_wait_time = time.time() - buffer_wait_start
                     logger.info(f"🎬 ✅ Intake buffer filled! {intake_size} frames ready after {buffer_wait_time:.1f}s - starting steady {target_fps}fps output")
+                    
+                    # Send stream started event to frontend
+                    await self.send_stream_event_to_frontend(
+                        "stream_started", 
+                        message="Avatar presentation stream has started",
+                        target_fps=target_fps,
+                        buffer_size=intake_size
+                    )
                     break
                 
                 # Log buffer filling progress every 2 seconds
@@ -2588,6 +2616,33 @@ class RapidoMainSystem:
         audio_data = audio_data * amplitude_modulation * pause_pattern
         
         return (audio_data * 32767 * 0.7).astype(np.int16).tobytes()
+    
+    async def send_stream_event_to_frontend(self, event_type: str, **event_data):
+        """Send stream events to frontend via LiveKit data channel"""
+        try:
+            if not hasattr(self, 'lk_room') or not self.lk_room:
+                logger.warning("⚠️ Cannot send event - LiveKit room not available")
+                return
+            
+            # Create event in same format as frontend expects
+            event_message = {
+                "id": f"avatar_event_{int(time.time() * 1000)}",
+                "event": event_type,
+                "timestamp": int(time.time() * 1000),
+                **event_data
+            }
+            
+            # Encode same way as frontend  
+            import json
+            data = json.dumps(event_message).encode('utf-8')
+            
+            # Send to all participants via data channel on "control" topic (same as frontend listens)
+            await self.lk_room.local_participant.publish_data(data, topic="control")
+            
+            logger.info(f"📤 Sent event to frontend: {event_type} (id: {event_message['id']})")
+            
+        except Exception as e:
+            logger.error(f"Failed to send stream event: {e}")
     
     async def process_presentation(self, input_json: str):
         """Complete presentation processing pipeline"""

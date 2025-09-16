@@ -33,7 +33,13 @@ class BrowserConfig:
         # CDP Screencast FPS - optimized for 25fps
         self.capture_fps = 25
         self.download_folder = "./captured_frames"
-        self.extension_path = "./rapido_system/core/chrome_extension"
+        # Calculate correct path to chrome extension from project root
+        import os
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        api_dir = os.path.dirname(current_dir)
+        rapido_system_dir = os.path.dirname(api_dir)
+        project_root = os.path.dirname(rapido_system_dir)
+        self.extension_path = os.path.join(project_root, "rapido_system", "core", "chrome_extension")
         self.browser_data_dir = "./browser_data"  # Chrome user profile directory
         self.capture_url = "https://test.creatium.com/presentation"  # Default capture URL
         self.capture_method = "cdp"  # Options: "cdp", "extension", "flag_based"
