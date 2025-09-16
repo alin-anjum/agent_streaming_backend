@@ -125,8 +125,8 @@ def generate_livekit_token(room_name: str, participant_name: str) -> str:
     current_time = int(time.time())
     
     # LiveKit credentials (should be moved to environment variables)
-    LIVEKIT_API_KEY = "APImuXsSp8NH5jY"
-    LIVEKIT_API_SECRET = "6k9Swe5O6NxeI0WvVTCTrs2k1Ec25byeM4NlnTCKn5GB"
+    LIVEKIT_API_KEY = "APIwYq3kxYAwbqP"
+    LIVEKIT_API_SECRET = "Jgp3uNValdBdnJefeAt8qk2ZGRsBFGNxk97NfelT9gKC"
     
     token_payload = {
         "iss": LIVEKIT_API_KEY,
@@ -312,7 +312,7 @@ async def generate_livekit_token_endpoint(request: LiveKitTokenRequest):
         room_name = request.lessonId  # Use lessonId as room name
         participant_name = f"user_{request.userId[:8]}_{request.sessionId[:8]}"  # Use userId + sessionId combination
         livekit_token = generate_livekit_token(room_name, participant_name)
-        livekit_url = "wss://rapido-pme0lo9d.livekit.cloud"
+        livekit_url = "wss://agent-staging-2y5e52au.livekit.cloud"
         
         logger.info(f"✅ Token generated for {participant_name} (user: {request.userId}, session: {request.sessionId}) in lesson room {room_name}")
         logger.info(f"💬 Frontend can send stop command: send(new TextEncoder().encode(JSON.stringify({{message: 'stop'}})))")

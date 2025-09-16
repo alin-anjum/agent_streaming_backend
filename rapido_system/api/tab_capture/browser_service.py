@@ -228,7 +228,7 @@ class BrowserAutomationService:
             logger.error(f"❌ Live frame capture to queue failed: {e}")
             raise
 
-    async def capture_first_frames_per_slide_to_queue(self, frame_queue: "asyncio.Queue"):
+    async def capture_first_frames_per_slide_to_queue(self, frame_queue: "asyncio.Queue", control_queue: "asyncio.Queue" = None):
         """Navigate slide-by-slide and enqueue only the first frame per slide, sleeping per slide duration.
 
         This uses parsed slide data at rapido_system/data/parsed_slideData/{video_job_id}.json
@@ -376,20 +376,40 @@ class BrowserAutomationService:
                 else:
                     # Enqueue one frame for this slide
                     try:
-                        frame_queue.put_nowait((global_index, frame_image))
-                        logger.info(f"📥 Enqueued first frame for slide {idx} (id={slide_id}) as index {global_index}")
+                        # Use floor to avoid overshoot; compositor adds a margin to hide nav latency
+                        expected_frames = int(duration_sec * 25.0)
+                        slide_meta = {
+                            "slide_index": idx,
+                            "slide_id": slide_id,
+                            "duration_ms": duration_ms,
+                            "expected_loop_frames": expected_frames
+                        }
+                        frame_queue.put_nowait((global_index, frame_image, slide_meta))
+                        logger.info(f"📥 Enqueued first frame for slide {idx} (id={slide_id}) as index {global_index} — expected ~{expected_frames} frames at 25fps")
                         global_index += 1
                     except Exception as e:
                         logger.warning(f"Queue operation failed for slide {slide_id}: {e}")
 
-                # Sleep for slide duration so consumer duplicates frame during this interval
-                sleep_seconds = duration_sec if duration_sec > 0 else 4.0
-                logger.info(f"⏳ Holding slide {idx} frame for {sleep_seconds:.2f}s before next slide")
-                try:
-                    await asyncio.sleep(sleep_seconds)
-                except asyncio.CancelledError:
-                    logger.info("⛔ Per-slide capture cancelled")
-                    break
+                # Either wait for control signal (preferred) or fall back to duration sleep
+                if control_queue is not None:
+                    logger.info(f"⏳ Waiting for compositor advance signal for slide {idx} (id={slide_id})")
+                    try:
+                        # Wait until compositor signals to advance to next slide
+                        await control_queue.get()
+                        control_queue.task_done()
+                        logger.info(f"➡️ Advance signal received for slide {idx} (id={slide_id})")
+                    except asyncio.CancelledError:
+                        logger.info("⛔ Per-slide capture cancelled while waiting for advance signal")
+                        break
+                else:
+                    # Sleep for slide duration so consumer duplicates frame during this interval
+                    sleep_seconds = duration_sec if duration_sec > 0 else 4.0
+                    logger.info(f"⏳ Holding slide {idx} frame for {sleep_seconds:.2f}s before next slide (no control queue)")
+                    try:
+                        await asyncio.sleep(sleep_seconds)
+                    except asyncio.CancelledError:
+                        logger.info("⛔ Per-slide capture cancelled")
+                        break
 
             logger.info("✅ Per-slide first-frame capture completed for all slides")
 

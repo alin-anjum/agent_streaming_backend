@@ -16,7 +16,7 @@ from .frame_processor import DynamicFrameProcessor
 
 logger = logging.getLogger(__name__)
 
-async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: asyncio.Queue, duration_seconds: Optional[int] = None, video_job_id: Optional[str] = None):
+async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: asyncio.Queue, duration_seconds: Optional[int] = None, video_job_id: Optional[str] = None, slide_advance_queue: Optional[asyncio.Queue] = None):
     """
     Start Playwright capture and feed frames directly to queue (no file system)
     Returns the BrowserAutomationService instance on success, or None on failure.
@@ -65,7 +65,7 @@ async def capture_presentation_frames_to_queue(capture_url: str, frame_queue: as
                 
                 if use_per_slide:
                     logger.info("🧩 Using per-slide first-frame capture based on parsed_slideData")
-                    await browser_service.capture_first_frames_per_slide_to_queue(frame_queue)
+                    await browser_service.capture_first_frames_per_slide_to_queue(frame_queue, control_queue=slide_advance_queue)
                 else:
                     logger.info("🎥 Using continuous live capture to queue (no parsed slide data found)")
                     await browser_service.capture_frames_live_to_queue(duration_seconds or 300, frame_queue)

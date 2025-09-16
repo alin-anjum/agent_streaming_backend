@@ -188,6 +188,7 @@ class RapidoMainSystem:
         # that watches the capture directory and feeds frames to a queue
         # for non-blocking consumption by the compositor.
         self.slide_frame_queue: Optional[asyncio.Queue] = None  # Created after capture starts
+        self.slide_control_queue: Optional[asyncio.Queue] = None  # Signals advance to next slide
         self._slide_producer_task: Optional[asyncio.Task] = None
         self.slide_frames_cache = {}  # Cache loaded slide frames by index
         self.slide_frame_count = 0    # Current number of available slide frames
@@ -565,9 +566,9 @@ class RapidoMainSystem:
             import time
             
             # LiveKit credentials
-            LIVEKIT_URL = "wss://rapido-pme0lo9d.livekit.cloud"
-            LIVEKIT_API_KEY = "APImuXsSp8NH5jY"
-            LIVEKIT_API_SECRET = "6k9Swe5O6NxeI0WvVTCTrs2k1Ec25byeM4NlnTCKn5GB"
+            LIVEKIT_URL = "wss://agent-staging-2y5e52au.livekit.cloud"
+            LIVEKIT_API_KEY = "APIwYq3kxYAwbqP"
+            LIVEKIT_API_SECRET = "Jgp3uNValdBdnJefeAt8qk2ZGRsBFGNxk97NfelT9gKC"
             
             # Get room name from config
             room_name = getattr(self.config, 'LIVEKIT_ROOM', 'avatar-room2')
@@ -756,9 +757,9 @@ class RapidoMainSystem:
             import time
             
             # LiveKit credentials
-            LIVEKIT_URL = "wss://rapido-pme0lo9d.livekit.cloud"
-            LIVEKIT_API_KEY = "APImuXsSp8NH5jY"
-            LIVEKIT_API_SECRET = "6k9Swe5O6NxeI0WvVTCTrs2k1Ec25byeM4NlnTCKn5GB"
+            LIVEKIT_URL = "wss://agent-staging-2y5e52au.livekit.cloud"
+            LIVEKIT_API_KEY = "APIwYq3kxYAwbqP"
+            LIVEKIT_API_SECRET = "Jgp3uNValdBdnJefeAt8qk2ZGRsBFGNxk97NfelT9gKC"
             
             # Get room name from config
             room_name = getattr(self.config, 'LIVEKIT_ROOM', 'avatar-room2')
@@ -1115,10 +1116,83 @@ class RapidoMainSystem:
                         if self.slide_frame_queue and not self.slide_frame_queue.empty():
                             try:
                                 # Get slide frame from queue (non-blocking)
-                                slide_frame_index_from_queue, slide_frame = self.slide_frame_queue.get_nowait()
+                                queue_item = self.slide_frame_queue.get_nowait()
+                                # Support both 2-tuple (index, image) and 3-tuple (index, image, meta)
+                                if isinstance(queue_item, tuple) and len(queue_item) >= 2:
+                                    slide_frame_index_from_queue = queue_item[0]
+                                    slide_frame = queue_item[1]
+                                    slide_meta = queue_item[2] if len(queue_item) >= 3 else None
+                                else:
+                                    slide_frame_index_from_queue = 0
+                                    slide_frame = queue_item
+                                    slide_meta = None
                                 slide_frame_available = True
                                 self.last_slide_frame = slide_frame  # Save for potential duplication
                                 self.last_slide_frame_index = slide_frame_index_from_queue
+                                
+                                # Handle per-slide loop counter on transition
+                                if slide_meta and isinstance(slide_meta, dict):
+                                    incoming_slide_id = slide_meta.get("slide_id")
+                                    incoming_slide_idx = slide_meta.get("slide_index")
+                                    expected_loop = slide_meta.get("expected_loop_frames")
+                                    
+                                    # Initialize tracking state if missing
+                                    if not hasattr(self, '_current_slide_id'):
+                                        self._current_slide_id = None
+                                        self._current_slide_index = None
+                                        self._current_slide_frame_loops = 0
+                                        self._advance_signal_time = None
+                                        self._last_nav_delay_frames = None
+                                    
+                                    # If slide changed, log previous and reset counter
+                                    if self._current_slide_id is not None and incoming_slide_id != self._current_slide_id:
+                                        logger.info(f"🧮 Slide {self._current_slide_index} ({self._current_slide_id}) looped for {self._current_slide_frame_loops} frames")
+                                        if hasattr(self, '_current_slide_expected') and self._current_slide_expected is not None:
+                                            logger.info(f"🎯 Expected ~{self._current_slide_expected} frames at 25fps")
+                                        self._current_slide_frame_loops = 0
+                                    
+                                    # Update current slide tracking
+                                    self._current_slide_id = incoming_slide_id
+                                    self._current_slide_index = incoming_slide_idx
+                                    # Add a small margin and subtract measured navigation delay from previous slide
+                                    margin_frames = 6
+                                    lead_frames = 0
+                                    try:
+                                        if hasattr(self, '_advance_signal_time') and self._advance_signal_time:
+                                            # Measure time from last advance signal to now (first frame of new slide)
+                                            nav_delay_sec = max(0.0, time.time() - self._advance_signal_time)
+                                            measured_lead = int(round(nav_delay_sec * 25.0))
+                                            self._last_nav_delay_frames = measured_lead
+                                            # Clamp lead between 2 and 120 frames
+                                            lead_frames = min(120, max(2, measured_lead))
+                                            logger.info(f"⏱️ Measured nav delay: {nav_delay_sec*1000:.0f}ms (~{measured_lead} frames); applying lead={lead_frames}")
+                                        elif hasattr(self, '_last_nav_delay_frames') and self._last_nav_delay_frames:
+                                            lead_frames = min(120, max(2, int(self._last_nav_delay_frames)))
+                                            logger.info(f"⏱️ Using last nav delay lead={lead_frames} frames")
+                                    except Exception:
+                                        lead_frames = 0
+                                    # Compute threshold with guard
+                                    base_expected = int(expected_loop or 0) + margin_frames - int(lead_frames)
+                                    self._current_slide_expected = max(1, base_expected)
+                                    # Reset signal time so we don't reuse it
+                                    self._advance_signal_time = None
+                                
+                                # Always count one frame consumption for current slide
+                                if hasattr(self, '_current_slide_frame_loops'):
+                                    self._current_slide_frame_loops += 1
+                                    # If we've reached expected frames, signal the capture to advance
+                                    try:
+                                        if hasattr(self, '_current_slide_expected') and isinstance(self._current_slide_expected, int) and self._current_slide_expected > 0:
+                                            if self._current_slide_frame_loops >= self._current_slide_expected:
+                                                if self.slide_control_queue is not None:
+                                                    # Record signal time to measure navigation latency
+                                                    self._advance_signal_time = time.time()
+                                                    self.slide_control_queue.put_nowait("advance")
+                                                    logger.info(f"➡️ Signaled advance after {self._current_slide_frame_loops} frames (threshold {self._current_slide_expected}) for slide {self._current_slide_index} ({self._current_slide_id})")
+                                                    # Set expected to None to avoid repeated signals for this slide
+                                                    self._current_slide_expected = None
+                                    except Exception:
+                                        pass
                                 
                                 if slide_frame_index % 25 == 0:  # Debug every second
                                     queue_size = self.slide_frame_queue.qsize()
@@ -1132,6 +1206,20 @@ class RapidoMainSystem:
                             if hasattr(self, 'last_slide_frame') and self.last_slide_frame is not None:
                                 # Duplicate last slide frame for smooth playback
                                 slide_frame = self.last_slide_frame.copy()
+                                # Count duplication towards current slide loops as well
+                                if hasattr(self, '_current_slide_frame_loops'):
+                                    self._current_slide_frame_loops += 1
+                                    # Check pacing condition on duplicates too
+                                    try:
+                                        if hasattr(self, '_current_slide_expected') and isinstance(self._current_slide_expected, int) and self._current_slide_expected > 0:
+                                            if self._current_slide_frame_loops >= self._current_slide_expected:
+                                                if self.slide_control_queue is not None:
+                                                    self._advance_signal_time = time.time()
+                                                    self.slide_control_queue.put_nowait("advance")
+                                                    logger.info(f"➡️ Signaled advance after {self._current_slide_frame_loops} frames (threshold {self._current_slide_expected}) for slide {self._current_slide_index} ({self._current_slide_id}) [duplicate]")
+                                                    self._current_slide_expected = None
+                                    except Exception:
+                                        pass
                                 if slide_frame_index % 25 == 0:  # Debug every second
                                     queue_size = self.slide_frame_queue.qsize() if self.slide_frame_queue else 0
                                     logger.info(f"🎬 🔄 SLIDE QUEUE EMPTY - duplicating last slide frame (queue: {queue_size})")
@@ -1814,6 +1902,9 @@ class RapidoMainSystem:
         if self.slide_frame_queue is None:
             self.slide_frame_queue = asyncio.Queue(maxsize=200)  # Buffer up to 100 slide frames
             logger.info("📥 Slide frame queue initialized (maxsize: 100)")
+        if self.slide_control_queue is None:
+            self.slide_control_queue = asyncio.Queue()  # Unbounded control signals
+            logger.info("🎚️ Slide control queue initialized for frame-based pacing")
         
         try:
             # Start dynamic capture (direct to queue - no file system)
@@ -1821,7 +1912,8 @@ class RapidoMainSystem:
             browser_service = await capture_presentation_frames_to_queue(
                 capture_url=self.capture_url,
                 frame_queue=self.slide_frame_queue,
-                video_job_id=self.video_job_id
+                video_job_id=self.video_job_id,
+                slide_advance_queue=self.slide_control_queue
             )
             
             if not browser_service:
