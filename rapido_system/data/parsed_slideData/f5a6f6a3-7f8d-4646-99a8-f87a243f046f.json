@@ -1,0 +1,66 @@
+{
+  "slides": [
+    {
+      "slideInfo": {
+        "position": 1,
+        "slideType": 1,
+        "narrationData": "Hello there, everyone! Today we're learning about LiveKit and how it helps developers create real-time communication applications like video calls and live streaming, and we'll explore its key features and how to implement basic functionality, so let's begin!",
+        "narrationDuration": 17214,
+        "slideId": "f7af40f6-c7af-4a9f-b3ab-ddc264bd8fa2",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 772.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 2,
+        "slideType": 2,
+        "narrationData": "",
+        "narrationDuration": "",
+        "slideId": "",
+        "embedId": "a705776c-89c2-4d5e-9258-17cffe2b4a17",
+        "presenterConfig": ""
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 3,
+        "slideType": 1,
+        "narrationData": "LiveKit is revolutionizing real-time communication for developers and businesses. This powerful platform enables seamless integration of video, audio, and data streaming capabilities into applications, opening up new possibilities for interactive experiences and collaboration.",
+        "narrationDuration": 20265,
+        "slideId": "839955dc-ec85-4bfb-a05b-45952a48f766",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 1382.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 4,
+        "slideType": 1,
+        "narrationData": "LiveKit is an open-source, real-time communication platform designed for building video, audio, and data streaming applications. Its core components include a server-side infrastructure that manages rooms and connections, client-side SDKs for various platforms, and APIs for integrating LiveKit functionality into applications. The server handles tasks such as signaling, media routing, and room management, while the SDKs provide developers with tools to implement real-time features in their applications efficiently.",
+        "narrationDuration": 35675,
+        "slideId": "80b3172b-ae66-4606-b75c-4e10e6e4f968",
+        "embedId": "",
+        "presenterConfig": ""
+      }
+    }
+  ]
+}

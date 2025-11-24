@@ -22,6 +22,7 @@ wheels/
 MANIFEST
 
 # Virtual Environment
+.venv/
 venv/
 env/
 ENV/
@@ -49,6 +50,12 @@ logs/
 temp/
 tmp/
 *.tmp
+
+# Unnecessary files
+captured_frames/
+browser_data/
+.browser_run_count
+captured_documents/
 
 # OS
 .DS_Store
@@ -97,3 +104,4 @@ frames_cache_854x480.pkl
 rapido_summary.json
 CHANGES_SUMMARY.md
 patch.txt
+output/

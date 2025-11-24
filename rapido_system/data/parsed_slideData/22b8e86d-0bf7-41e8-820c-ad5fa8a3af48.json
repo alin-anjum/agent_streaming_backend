@@ -1,0 +1,21 @@
+{
+  "slides": [
+    {
+      "slideInfo": {
+        "position": 1,
+        "slideType": 1,
+        "narrationData": "this is some dumb shit narration",
+        "narrationDuration": 4478,
+        "slideId": "bfab0faf-cb79-43fc-ba93-32178dab6502",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 670.4,
+          "left": 755.2,
+          "isEditable": true
+        }
+      }
+    }
+  ]
+}
