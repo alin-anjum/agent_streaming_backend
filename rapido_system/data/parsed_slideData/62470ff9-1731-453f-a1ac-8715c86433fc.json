@@ -1,0 +1,86 @@
+{
+  "slides": [
+    {
+      "slideInfo": {
+        "position": 1,
+        "slideType": 1,
+        "narrationData": "Lucknow, the capital city of Uttar Pradesh, [laughs] India, is a vibrant metropolis steeped [giggle] in history and culture. This educational video explores Lucknow's geographical significance, rich heritage, economic landscape, and cultural identity, providing valuable insights for professionals and businesses operating in the region",
+        "narrationDuration": 22937,
+        "slideId": "7421fc86-de66-4d56-8a49-d14de9d1ac6f",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 122.39999999999998,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 2,
+        "slideType": 1,
+        "narrationData": "Lucknow is situated in the northern Indian state of Uttar Pradesh, along the banks of the Gomti River. The city serves as the administrative capital of Uttar Pradesh and is divided into six zones and 110 wards for governance purposes. Lucknow has a population of approximately 3.5 million people, making it one of the most populous urban centers in North India. The city's demographics reflect a diverse mix of religions, with Hindus forming the majority, followed by Muslims, Sikhs, and other communities. This diversity contributes to Lucknow's multicultural atmosphere and influences its social and economic dynamics",
+        "narrationDuration": 48873,
+        "slideId": "052fe49b-ac67-4a19-ad21-6cb0891cd23d",
+        "embedId": "",
+        "presenterConfig": ""
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 3,
+        "slideType": 1,
+        "narrationData": "Lucknow's history is deeply intertwined with the Nawabi era, British colonial rule, and India's struggle for independence. The city rose to prominence in the 18th century as the capital of the Nawabs of Awadh, who were known for their patronage of arts, culture, and architecture. During this period, Lucknow became a center of refinement and artistic expression, earning it the moniker City of Nawabs. The British East India Company annexed Awadh in 1856, leading to Lucknow's role in the Indian Rebellion of 1857. The city witnessed significant battles and sieges during this period, including the famous Siege of Lucknow. Post-independence, Lucknow continued to play a crucial role in Indian politics and culture, serving as the capital of Uttar Pradesh and a major center for education and administration",
+        "narrationDuration": 57664,
+        "slideId": "6e60778f-9d82-4496-bded-7f89926beaba",
+        "embedId": "",
+        "presenterConfig": ""
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 4,
+        "slideType": 1,
+        "narrationData": "Lucknow's economy is characterized by a mix of traditional industries and emerging sectors. The city has a strong presence in handicrafts, particularly chikan embroidery and zardozi work, which provide employment to a significant portion of the workforce. Information technology and IT-enabled services have grown rapidly in recent years, with several tech parks and software development centers established in the city. Lucknow is also an important center for automobile manufacturing, with major companies operating production facilities in the region. The service sector, including retail, healthcare, and education, contributes significantly to the city's economy. Government administration and public sector enterprises remain major employers, given Lucknow's status as the state capital. The city has seen substantial infrastructure development, including the construction of a metro rail system, improved road networks, and the expansion of its international airport, which has enhanced connectivity and attracted investment",
+        "narrationDuration": 70881,
+        "slideId": "1c7d17c8-60c1-483e-a4b3-7abecc79825f",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 1382.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 5,
+        "slideType": 1,
+        "narrationData": "Lucknow's cultural heritage is a defining aspect of its identity, blending Nawabi traditions with contemporary influences. The city is renowned for its Urdu poetry, classical music, and dance forms such as Kathak. Lucknow's cuisine, particularly its kebabs, biryani, and chaat, is famous throughout India. The city's architectural landscape is dotted with historical monuments like the Bara Imambara, Chota Imambara, and Rumi Darwaza, which showcase the grandeur of Nawabi and colonial-era architecture. The Lucknowi dialect of Urdu, known for its politeness and refinement, is an integral part of the city's cultural fabric. Annual events like the Lucknow Mahotsav celebrate the city's arts, crafts, and culinary traditions, attracting visitors from across the country",
+        "narrationDuration": 55818,
+        "slideId": "08345075-4a5c-45b8-a7ab-6bfb8cf41837",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 1382.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    }
+  ]
+}

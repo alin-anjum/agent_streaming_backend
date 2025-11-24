@@ -42,13 +42,8 @@ if sync_talk_path not in sys.path:
     sys.path.append(sync_talk_path)
 
 from rapido_system.core.config.config import Config
-try:
-    from rapido_system.api.rapido_main import RapidoMainSystem
-except Exception:
-    # Temporary fallback while rapido_main.py is being refactored
-    from rapido_system.api_backup_20250917_082854.rapido_main import RapidoMainSystem
+from rapido_system.api.rapido_main import RapidoMainSystem
 from rapido_system.api.video_job_service import fetch_and_store_video_job
-from rapido_system.api.azure_queue_consumer import start_consumer_with_callback, stop_consumer
 
 # Setup logging
 logging.basicConfig(
@@ -63,32 +58,6 @@ app = FastAPI(
     description="Real-time Avatar Presentation API",
     version="1.0.0"
 )
-# Lifespan handlers to start/stop Azure queue consumer
-@app.on_event("startup")
-async def on_startup():
-    async def _process_payload(payload: Dict[str, Any]):
-        """Process a message from Azure queue and start a session."""
-        try:
-            # Expected payload keys in message
-            lesson_id = payload.get("lessonId")
-            video_job_id = payload.get("lessonId") or payload.get("docId") or "unknown"
-            capture_url = payload.get("captureUrl", "http://localhost:5173/video-capture/default")
-            avatar_name = payload.get("avatarName", "enrique_torres")
-            room_name = lesson_id or video_job_id
-
-            logger.info(f"📥 AzureQ message received → lesson:{lesson_id} job:{video_job_id} avatar:{avatar_name}")
-
-            # Start the same flow used by token endpoint
-            asyncio.create_task(auto_start_presentation(room_name, lesson_id or video_job_id, video_job_id, capture_url))
-        except Exception as e:
-            logger.error(f"Failed to process Azure queue payload: {e}")
-
-    await start_consumer_with_callback(app, _process_payload)
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    await stop_consumer(app)
 
 # CORS middleware for frontend access
 app.add_middleware(

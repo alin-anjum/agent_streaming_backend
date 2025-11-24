@@ -42,3 +42,12 @@ class Config:
     
     # LiveKit room configuration (can be overridden by FastAPI)
     LIVEKIT_ROOM = os.getenv('LIVEKIT_ROOM', 'default-room')
+
+    # LiveKit Credentials and URL (env-driven)
+    LIVEKIT_URL = os.getenv('LIVEKIT_URL', 'wss://agent-dev-tzdsmuu4.livekit.cloud')
+    LIVEKIT_API_KEY = os.getenv('LIVEKIT_API_KEY', 'APIiUtPzB9GNpZu')
+    LIVEKIT_API_SECRET = os.getenv('LIVEKIT_API_SECRET', 'tRQ7EP1eKbOeyAze2K0zKffSrISDiK9soNfu3L2naJlA')
+
+    # Slide timing adjustments
+    # Positive number of frames to extend each slide's on-screen hold (e.g., 25 or 30)
+    SLIDE_EXTRA_HOLD_FRAMES = int(os.getenv('SLIDE_EXTRA_HOLD_FRAMES', '25'))

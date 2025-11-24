@@ -1,0 +1,166 @@
+{
+  "slides": [
+    {
+      "slideInfo": {
+        "position": 1,
+        "slideType": 1,
+        "narrationData": "Hello there, everyone! Today we're going beyond basic hello world programs to build a strong programming foundation by exploring their components, learning how to execute and troubleshoot them, and discovering how these concepts apply to real workplace projects, so let's begin!",
+        "narrationDuration": 19460,
+        "slideId": "4c5f5a28-49c5-47f2-afc3-8bafc68c4d0c",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 772.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 2,
+        "slideType": 1,
+        "narrationData": "Hello World programs serve as the gateway to learning programming languages and testing development environments. This fundamental concept plays a crucial role in software development workflows and provides a simple yet powerful way to verify system functionality.",
+        "narrationDuration": 19708,
+        "slideId": "70b979a1-febf-4bf9-94e7-59e6f8ec4e5f",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 1382.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 3,
+        "slideType": 1,
+        "narrationData": "A Hello World program is a simple computer program that outputs or displays the text Hello World to a user. It is often the first program written by people learning to code. These programs serve as a starting point for understanding the basic syntax and structure of a programming language. Hello World programs also play a vital role in software development workflows by allowing developers to quickly test if a programming environment is set up correctly and functioning as expected.",
+        "narrationDuration": 31509,
+        "slideId": "662044c8-594f-4665-a946-678ef684af56",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 1382.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 4,
+        "slideType": 1,
+        "narrationData": "While the specific syntax varies between programming languages most Hello World programs share common elements. These typically include a main function or entry point where the program begins execution. The program usually contains a print or output statement that displays the Hello World text. Some languages require additional components such as import statements for necessary libraries or specific formatting rules. Understanding these basic elements helps developers quickly grasp the fundamental structure of new programming languages they encounter in their work.",
+        "narrationDuration": 39641,
+        "slideId": "9f70cf37-c112-489f-8722-4af4d655219f",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 1382.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 5,
+        "slideType": 1,
+        "narrationData": "Running a Hello World program involves using development tools and programming environments common in workplace technology systems. This process typically starts with writing the code in a text editor or integrated development environment IDE. The code is then compiled or interpreted depending on the language. Finally the program is executed either through a command line interface or within the IDE. This execution process helps developers familiarize themselves with the tools and workflows used in their specific work environment.",
+        "narrationDuration": 36591,
+        "slideId": "fa277e50-9da0-4b1b-ac49-ed5269bf5908",
+        "embedId": "",
+        "presenterConfig": ""
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 6,
+        "slideType": 1,
+        "narrationData": "Even simple Hello World programs can encounter errors especially when working in new or unfamiliar development environments. Common issues include syntax errors such as missing semicolons or brackets. Another frequent problem is incorrectly configured development environments leading to compilation or execution failures. By troubleshooting these issues developers gain valuable experience in identifying and resolving programming errors. This skill is essential for more complex projects they will encounter in their professional work.",
+        "narrationDuration": 38548,
+        "slideId": "7a9b0afe-0819-4159-935c-cf0625a796f1",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 122.39999999999998,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 7,
+        "slideType": 1,
+        "narrationData": "Hello World programs have practical applications beyond just learning new languages. In workplace projects these simple programs are often used to verify system functionality and test development environment setups. For example when setting up a new server or development machine running a Hello World program can quickly confirm that the programming language and necessary tools are correctly installed and configured. This practice helps ensure smooth project initiation and can prevent more significant issues from arising later in the development process.",
+        "narrationDuration": 39081,
+        "slideId": "7193fc16-a026-412f-83d8-894d7111fe50",
+        "embedId": "",
+        "presenterConfig": ""
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 8,
+        "slideType": 1,
+        "narrationData": "Hello World programs are fundamental tools in programming and software development. They serve as learning aids for new languages introduce essential programming concepts and play a crucial role in verifying development environments. Understanding and applying Hello World concepts is a valuable skill for professionals in technology-related fields.",
+        "narrationDuration": 25527,
+        "slideId": "2a159ced-c2a0-4c37-a677-3115f5f0f7a0",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 1382.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 9,
+        "slideType": 1,
+        "narrationData": "Now that we've explored the programming fundamentals that take you beyond basic hello world examples, take some time to practice these concepts and review the key principles we covered so you can apply them confidently in your future programming projects.",
+        "narrationDuration": 16745,
+        "slideId": "90c87898-9a77-4d7f-8bb0-5a025ffe1ac3",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 762.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    }
+  ]
+}

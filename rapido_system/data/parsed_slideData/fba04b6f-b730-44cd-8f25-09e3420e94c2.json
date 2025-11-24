@@ -1,0 +1,64 @@
+{
+  "slides": [
+    {
+      "slideInfo": {
+        "position": 1,
+        "slideType": 1,
+        "narrationData": "Football is a beloved sport that combines strategy, athleticism, and teamwork. This program will explore the fundamentals of football, from basic rules and positions to essential skills and safety protocols, preparing you for informed participation in workplace football events. café, résumé, naïve",
+        "narrationDuration": 23290,
+        "slideId": "54b6f6cd-35a7-4ea5-b13b-2990c497f429",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 122.39999999999998,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 2,
+        "slideType": 1,
+        "narrationData": "Football is played on a 100-yard field with end zones at each end. The objective is to score points by advancing the ball into the opponent's end zone for a touchdown or kicking it through the goal posts for a field goal.café, résumé, naïve Each team has four downs to advance the ball 10 yards. If successful, they receive a new set of downs. If not, they typically punt the ball to the other team. A game consists of four 15-minute quarters, with the team scoring the most points declared the winner.",
+        "narrationDuration": 38267,
+        "slideId": "47a93953-f14a-44bd-bfef-98e336d923d9",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 1382.4,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    },
+    {
+      "slideInfo": {
+        "position": 3,
+        "slideType": 1,
+        "narrationData": "Football teams are divided into offense, defense, and special teams. Key offensive positions include the quarterback, who leads the offense and throws passes, running backs who carry the ball, and wide receivers who catch passes. On defense, linebackers café, résumé, naïve",
+        "narrationDuration": 22802,
+        "slideId": "58d6e4bb-57d3-47ec-8d8f-f7f267271a02",
+        "embedId": "",
+        "presenterConfig": {
+          "scaleX": 0.2,
+          "scaleY": 0.2,
+          "top": 674.8,
+          "left": 122.39999999999998,
+          "type": "rectangle",
+          "display": true,
+          "isEditable": true,
+          "visible": true
+        }
+      }
+    }
+  ]
+}
